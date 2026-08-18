@@ -39,11 +39,45 @@ same thing — no new vocabulary to learn or to put in an agent's context.
 ```
 $ cc4a
 COMMANDS
+  status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 ```
+
+### `cc4a status` — session, account and configuration facts
+
+```
+$ cc4a status
+version       2.1.234
+session       331f014e-e03d-439d-a947-dc7da0334c6c  (interactive cli)
+name          external-source-c4  (derived)
+started       Tue Aug 18 01:10:43 2026
+cwd           /Users/jimmy/external-source
+peer          uds:/tmp/cc-socks/62460.sock
+model         opus[1m]  (claude-opus-5)
+effort        high
+account       James <you@example.com>  (max)
+organization  your organization
+settings      user, user (local)
+mcp           4 configured: chrome-devtools, circleci-mcp-server, figma, mcp-atlassian
+              configured only; live connection state is in-process (see /mcp)
+```
+
+Most of it is free, from `~/.claude/sessions/<pid>.json` and the environment. Name,
+email, organization and plan need one network call, cached 24h; `--local` skips it.
+
+Two fields in `/status` are **not** reproducible outside the running process, and
+cc4a says so rather than printing a plausible number:
+
+- **MCP connection state.** cc4a lists servers found in configuration. `/status`
+  also counts servers needing auth and disabled ones — including account-level
+  connectors that appear nowhere on disk — so its totals are usually higher. `/mcp`
+  has the live state.
+- **The session's display name.** Claude Code shows an AI-generated title once one
+  exists; on disk the name is often still the derived one, so cc4a reports that and
+  tags it with its `nameSource`.
 
 ### `cc4a context` — this session's context window
 

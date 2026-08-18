@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -15,6 +15,7 @@ USAGE
   cc4a <command> [options]
 
 COMMANDS
+  status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   statusline  sidecar mode; see `cc4a statusline --help`
@@ -82,6 +83,29 @@ Add to ~/.claude/settings.json:
 
 Note that configuring any custom status line suppresses some built-in footer hints.
 Not meant to be run by hand.
+"""
+
+STATUS_HELP = """cc4a status — session, account and configuration facts.
+
+USAGE
+  cc4a status [--json] [--local]
+
+  --local   skip the account lookup; report only what is on disk
+
+Mirrors the /status pane. Most fields come from ~/.claude/sessions/<pid>.json and
+the environment, for free. Account name, email, organization and plan need one
+network call, cached 24h; --local skips it.
+
+NOT REPORTED, because it is not reachable outside the running process:
+
+  MCP connection state. This lists servers found in configuration. /status also
+  counts servers that need auth or are disabled, including account-level
+  connectors that appear nowhere on disk, so its totals are usually higher.
+  Run /mcp for live state.
+
+  The session's display name may be stale. Claude Code shows an AI-generated
+  title once one exists; the on-disk name is often still the derived one, which
+  is what this reports, tagged with its nameSource.
 """
 
 UPDATE_HELP = """cc4a update — install the latest version from the repo.
@@ -311,6 +335,165 @@ def human_usage(u):
         for e in u["limits"])
 
 
+# ---------- status ----------
+PROFILE_CACHE = os.path.join(CACHE, "cc4a-profile.json")
+PROFILE_TTL = 86400
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+
+
+def session_record(sid):
+    pid = os.environ.get("CLAUDE_PID")
+    cands = []
+    if pid:
+        cands.append(os.path.join(HOME, ".claude", "sessions", "%s.json" % pid))
+    cands += sorted(glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")))
+    for c in cands:
+        try:
+            with open(c) as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not sid or d.get("sessionId") == sid:
+            return d
+    return {}
+
+
+def fetch_profile():
+    try:
+        st = os.stat(PROFILE_CACHE)
+        if time.time() - st.st_mtime < PROFILE_TTL:
+            with open(PROFILE_CACHE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    tok = oauth_token()
+    if not tok:
+        return None
+    req = urllib.request.Request(PROFILE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20", "User-Agent": "cc4a"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = PROFILE_CACHE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, PROFILE_CACHE)
+    return data
+
+
+def setting_sources():
+    out = []
+    for label, p in (("user", os.path.join(HOME, ".claude", "settings.json")),
+                     ("user (local)", os.path.join(HOME, ".claude", "settings.local.json")),
+                     ("project", os.path.join(os.getcwd(), ".claude", "settings.json")),
+                     ("project (local)", os.path.join(os.getcwd(), ".claude", "settings.local.json"))):
+        if os.path.exists(p):
+            out.append(label)
+    return out
+
+
+def configured_mcp():
+    names = []
+    try:
+        with open(os.path.join(HOME, ".claude.json")) as f:
+            d = json.load(f)
+        names += list((d.get("mcpServers") or {}).keys())
+        proj = (d.get("projects") or {}).get(os.getcwd(), {})
+        names += list((proj.get("mcpServers") or {}).keys())
+    except Exception:
+        pass
+    return sorted(set(names))
+
+
+def build_status(sid, local_only=False):
+    rec = session_record(sid)
+    model = ""
+    for p in (os.path.join(HOME, ".claude", "settings.local.json"),
+              os.path.join(HOME, ".claude", "settings.json")):
+        try:
+            with open(p) as f:
+                model = json.load(f).get("model") or model
+        except Exception:
+            pass
+        if model:
+            break
+    ctx = build_context(sid) if sid else {}
+
+    out = {
+        "version": rec.get("version"),
+        "session_id": sid or rec.get("sessionId"),
+        "session_kind": rec.get("kind"),
+        "entrypoint": rec.get("entrypoint"),
+        "session_name": rec.get("name"),
+        "session_name_source": rec.get("nameSource"),
+        "started_at": rec.get("procStart"),
+        "cwd": os.getcwd(),
+        "session_cwd": rec.get("cwd"),
+        "peer_address": ("uds:" + rec["messagingSocketPath"]) if rec.get("messagingSocketPath")
+                        else os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"),
+        "model": model or None,
+        "model_id": ctx.get("model"),
+        "effort": os.environ.get("CLAUDE_EFFORT"),
+        "setting_sources": setting_sources(),
+        "mcp_servers_configured": configured_mcp(),
+        "mcp_note": "configured only; live connection state is in-process (see /mcp)",
+    }
+    if not local_only:
+        pr = fetch_profile() or {}
+        acct, org = pr.get("account") or {}, pr.get("organization") or {}
+        out["account"] = {"name": acct.get("full_name"), "email": acct.get("email"),
+                          "plan": "max" if acct.get("has_claude_max")
+                                  else "pro" if acct.get("has_claude_pro") else None} if acct else None
+        out["organization"] = org.get("name")
+    return out
+
+
+def human_status(s):
+    rows = []
+    add = lambda k, v: rows.append((k, v)) if v else None
+    add("version", s.get("version"))
+    sid = s.get("session_id")
+    kind = " ".join(x for x in (s.get("session_kind"), s.get("entrypoint")) if x)
+    add("session", "%s%s" % (sid, "  (%s)" % kind if kind else "") if sid else None)
+    if s.get("session_name"):
+        add("name", "%s%s" % (s["session_name"],
+                              "  (%s)" % s["session_name_source"] if s.get("session_name_source") else ""))
+    add("started", s.get("started_at"))
+    add("cwd", s.get("cwd"))
+    add("peer", s.get("peer_address"))
+    m = s.get("model")
+    if m and s.get("model_id") and s["model_id"] not in m:
+        m = "%s  (%s)" % (m, s["model_id"])
+    add("model", m)
+    add("effort", s.get("effort"))
+    a = s.get("account") or {}
+    if a.get("email"):
+        add("account", "%s <%s>%s" % (a.get("name") or "?", a["email"],
+                                      "  (%s)" % a["plan"] if a.get("plan") else ""))
+    add("organization", s.get("organization"))
+    add("settings", ", ".join(s.get("setting_sources") or []))
+    mcp = s.get("mcp_servers_configured") or []
+    add("mcp", "%d configured: %s" % (len(mcp), ", ".join(mcp)) if mcp else None)
+    w = max(len(k) for k, _ in rows) if rows else 0
+    lines = ["%-*s  %s" % (w, k, v) for k, v in rows]
+    if mcp:
+        lines.append("%-*s  %s" % (w, "", s["mcp_note"]))
+    return "\n".join(lines)
+
+
+def cmd_status(argv):
+    if "--help" in argv or "-h" in argv:
+        print(STATUS_HELP)
+        return 0
+    s = build_status(session_id(argv), local_only="--local" in argv)
+    print(json.dumps(s, indent=2) if "--json" in argv else human_status(s))
+    return 0 if s.get("session_id") else 1
+
+
 # ---------- update ----------
 def in_git_clone(path):
     d = os.path.dirname(path)
@@ -441,7 +624,7 @@ def cmd_statusline(argv):
     return 0
 
 
-COMMANDS = {"context": cmd_context, "usage": cmd_usage,
+COMMANDS = {"status": cmd_status, "context": cmd_context, "usage": cmd_usage,
             "statusline": cmd_statusline, "update": cmd_update}
 
 

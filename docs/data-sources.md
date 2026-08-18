@@ -117,6 +117,46 @@ The `limit_dollars` / `used_dollars` / `remaining_dollars` fields are `null` on
 subscription plans. **There is no absolute cap to read** — only utilization
 percentage. This is why `/usage` shows percentages too. Don't invent a denominator.
 
+## Session and account facts
+
+`~/.claude/sessions/<pid>.json` is written per running process and carries most of
+what `/status` displays:
+
+```json
+{ "pid": 62460, "sessionId": "...", "cwd": "...", "version": "2.1.234",
+  "kind": "interactive", "entrypoint": "cli", "name": "external-source-c4",
+  "nameSource": "derived", "status": "busy",
+  "messagingSocketPath": "/tmp/cc-socks/62460.sock" }
+```
+
+Locate it via `$CLAUDE_PID`, or scan the directory for a matching `sessionId`.
+Two caveats: `cwd` is where the session started and may not be the live directory,
+and `name` is often the *derived* name (`external-source-c4`) even when the UI is
+showing an AI-generated title — the title is not written here.
+
+Account identity comes from a second undocumented OAuth endpoint, same auth as the
+usage one:
+
+```
+GET https://api.anthropic.com/api/oauth/profile
+```
+
+Returns `account` (`full_name`, `email`, `has_claude_max`, `has_claude_pro`) and
+`organization` (`name`, `organization_type`, `billing_type`). Changes rarely, so
+cache it for a day rather than per call. `subscriptionType` is also available
+locally in the keychain credential blob, without any network call.
+
+## MCP servers are not fully on disk
+
+`~/.claude.json` holds `mcpServers` globally and per project under
+`projects.<cwd>.mcpServers`, plus `enabledMcpjsonServers` / `disabledMcpjsonServers`.
+
+This is **configuration, not state**, and it is incomplete: account-level connectors
+provided through your Claude account — Gmail, Google Calendar, Google Drive — appear
+in `/status` counts and in the session's tool list while existing in no local file.
+Connection status lives only in the running process. Any tool reporting "N connected"
+from disk is guessing; report configured servers and say so.
+
 ## Session identity
 
 `$CLAUDE_CODE_SESSION_ID` is exported into every Bash tool call, so an agent can
