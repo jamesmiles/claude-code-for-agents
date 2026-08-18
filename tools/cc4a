@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -69,6 +69,12 @@ USAGE
   Reads an undocumented OAuth endpoint, cached 60s. Exits 1 if unavailable, which
   means the account uses an API key rather than a Pro/Max subscription, or the
   endpoint changed. Report that as unknown, not as healthy.
+
+  The endpoint is rate limited. Failures are cached as well as successes, so a
+  failing read backs off (Retry-After when the response carries it, otherwise
+  10s doubling to 5m) instead of re-firing on the next call. The backoff is a file
+  in the cache directory, so separate cc4a invocations share it. While it is in
+  force the source reads "http-429 (backing off, 12s left)" and no request is sent.
 
 IF YOU ARE AN AGENT RUNNING THIS
   5-hour window above ~80%: say so before starting an expensive fan-out and let the
@@ -163,6 +169,7 @@ EXIT CODES
      does not distinguish them. The message does: "timed out after 6s" vs
      "met after 0s". For a gate, 3 is the normal negative branch, not an error.
   4  stalled: watching your own state from a call that blocks it (see below)
+     A 429 from the usage endpoint lands here, not in "not met" — see exit 5.
   5  inconclusive: a condition could not be read, so its threshold may have been
      crossed unobserved. NOT the same as "not met" — an unreadable value is not a
      false one. Returned in two situations: a condition stayed unavailable for
@@ -320,7 +327,56 @@ HOME = os.path.expanduser("~")
 CACHE = os.path.join(HOME, ".claude", "cache")
 LIMITS_CACHE = os.path.join(CACHE, "cc4a-limits.json")
 LIMITS_TTL = 60
+FAIL_CACHE = os.path.join(CACHE, "cc4a-limits-fail.json")
+BACKOFF_BASE = 10       # seconds after the first failure
+BACKOFF_CAP = 300       # never wait longer than this between attempts
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+# A condition whose data is missing for one of these reasons will never recover on
+# its own; anything else (a 5xx, a 429, a dropped connection) may be worth retrying.
+PERMANENT_UNAVAILABLE = ("no-oauth-token", "http-401", "http-403", "http-404")
+
+
+def is_permanent(src):
+    return any((src or "").startswith(x) for x in PERMANENT_UNAVAILABLE)
+
+
+def _read_fail():
+    try:
+        with open(FAIL_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _record_fail(status, retry_after, prev):
+    """Persist the failure so the next attempt waits instead of re-firing at once.
+
+    Only successful reads were cached before, so a failing endpoint was retried on
+    every single poll. Against a rate limiter that is self-sustaining: the 429 is
+    what keeps the caller hammering, and the hammering is what keeps the 429.
+    """
+    n = (prev or {}).get("consecutive", 0) + 1
+    wait = retry_after if retry_after is not None else min(
+        BACKOFF_CAP, BACKOFF_BASE * (2 ** (n - 1)))
+    rec = {"status": status, "consecutive": n, "retry_after_header": retry_after,
+           "failed_at": time.time(), "retry_at": time.time() + max(1, wait)}
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        tmp = FAIL_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.replace(tmp, FAIL_CACHE)
+    except OSError:
+        pass
+    return rec
+
+
+def _clear_fail():
+    try:
+        os.remove(FAIL_CACHE)
+    except OSError:
+        pass
 
 
 def sidecar_path(sid):
@@ -366,6 +422,12 @@ def fetch_limits():
                 return json.load(f), "cache"
     except Exception:
         pass
+    # Still inside a backoff window from an earlier failure: do not send anything.
+    fail = _read_fail()
+    if fail and time.time() < fail.get("retry_at", 0):
+        return None, "%s (backing off, %ds left)" % (
+            fail.get("status", "?"), int(fail["retry_at"] - time.time()))
+
     tok = oauth_token()
     if not tok:
         return None, "no-oauth-token"
@@ -378,9 +440,24 @@ def fetch_limits():
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.load(r)
     except urllib.error.HTTPError as e:
-        return None, "http-%d" % e.code
+        # 429 and 503 usually say when to come back; obey that over our own guess.
+        ra = None
+        try:
+            raw = (e.headers or {}).get("Retry-After")
+            if raw and str(raw).strip().isdigit():
+                ra = int(str(raw).strip())
+        except Exception:
+            ra = None
+        status = "http-%d" % e.code
+        rec = _record_fail(status, ra, fail)
+        return None, "%s (retry in %ds%s)" % (
+            status, int(rec["retry_at"] - time.time()),
+            ", per Retry-After" if ra is not None else "")
     except Exception as e:
-        return None, "error-%s" % type(e).__name__
+        status = "error-%s" % type(e).__name__
+        rec = _record_fail(status, None, fail)
+        return None, "%s (retry in %ds)" % (status, int(rec["retry_at"] - time.time()))
+    _clear_fail()
     os.makedirs(CACHE, exist_ok=True)
     tmp = LIMITS_CACHE + ".tmp"
     with open(tmp, "w") as f:
@@ -569,13 +646,7 @@ def session_status(sid):
 
 WINDOW_KIND = {"five_hour": "session", "seven_day": "weekly_all"}
 
-# A condition whose data is missing for one of these reasons will never recover on
-# its own; anything else (a 5xx, a dropped connection) may be a blip worth riding out.
-PERMANENT_UNAVAILABLE = ("no-oauth-token", "http-401", "http-403", "http-404")
 
-
-def is_permanent(src):
-    return any((src or "").startswith(x) for x in PERMANENT_UNAVAILABLE)
 
 
 def usage_pct(window):

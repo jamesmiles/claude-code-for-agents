@@ -101,6 +101,15 @@ anthropic-beta: oauth-2025-04-20
 request for official programmatic access. Treat a failure as "unknown", never as
 "fine".
 
+**It is rate limited, so cache failures, not just successes.** A cache that holds
+only successful reads turns a rate limit into a feedback loop: the 429 is not
+cached, the next poll re-fires immediately, and that earns another 429. Measured on
+a 2s poller: 11 outbound requests for 10 polls, with no backoff and no way for the
+caller to tell it was the cause. Record the failure with a retry time — honouring
+`Retry-After` when present, otherwise exponential — and keep that state in a file so
+concurrent processes share it. Surface it in whatever you report, or the caller
+cannot distinguish "throttled by my own polling" from any other outage.
+
 Returns `five_hour` / `seven_day` objects plus a richer `limits[]` array:
 
 ```json
