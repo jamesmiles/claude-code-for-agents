@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -98,10 +98,16 @@ USAGE
 CONDITIONS
   --usage-above=N     5h window at or above N%   (--window=seven_day for weekly)
   --usage-below=N     5h window at or below N%   (i.e. wait for a reset)
-  --context-above=N   another session's context at or above N%
-  --context-below=N   another session's context at or below N%
+  --context-above=N   a session's context at or above N%
+  --context-below=N   a session's context at or below N%
 
-  Context conditions require --session=<id>; see below. Give as many conditions as
+  Context conditions default to --session=<id>, or this session if that is omitted.
+  To watch several sessions at once, name the target on the condition itself:
+
+    cc4a wait --context-above=80@<id-a> --context-above=80@<id-b> --any
+
+  which wakes on whichever crosses first. A bare --session= still sets the default
+  for any condition that does not carry its own @target. Give as many conditions as
   you like. --any returns when the first is met (default), --all when every one is
   met at the same poll. They are evaluated together in one loop, so this is how you
   compose them — `cc4a wait --usage-above=90 --context-above=75 --any` does what
@@ -480,10 +486,12 @@ def cmd_wait(argv):
             elif a.startswith("--usage-") or a.startswith("--context-"):
                 name, _, val = a[2:].partition("=")
                 kind, _, op = name.partition("-")
+                # a condition may name its own target: --context-above=80@<session-id>
+                val, _, target = val.partition("@")
                 if op not in ("above", "below") or not val:
                     raise ValueError("bad condition %r; use --%s-above=N or --%s-below=N"
                                      % (a, kind, kind))
-                conds.append({"kind": kind, "op": op,
+                conds.append({"kind": kind, "op": op, "target": target or None,
                               "threshold": float(val.rstrip("%"))})
             elif a != "--json":
                 raise ValueError("unknown option %r" % a)
@@ -501,7 +509,7 @@ def cmd_wait(argv):
         if c["kind"] == "usage":
             c["window"] = window
             continue
-        c["session"] = sid or me or ""
+        c["session"] = c.get("target") or sid or me or ""
         if not c["session"]:
             print("--context-* needs --session=<id>", file=sys.stderr)
             return 2

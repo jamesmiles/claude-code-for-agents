@@ -168,11 +168,30 @@ your limit" is not a computable number and cc4a does not imply one.
 ```sh
 cc4a wait --usage-above=90                          # 5h window hits 90%
 cc4a wait --usage-below=5 --timeout=6h              # wait out a window reset
-cc4a wait --usage-above=90 --context-above=75 --session=<id> --any
+cc4a wait --usage-above=90 --context-above=75@<id> --any
+cc4a wait --context-above=80@<worker-a> --context-above=80@<worker-b> --any
 ```
 
 Conditions are `--usage-above/below=N` (add `--window=seven_day` for the weekly cap)
-and `--context-above/below=N`. Exit `0` when met, `3` on timeout.
+and `--context-above/below=N`. A context condition may name its own target with
+`@<session-id>`, so one call can watch several sessions at different thresholds;
+a bare `--session=` sets the default for conditions without an `@target`. Exit `0`
+when met, `3` on timeout.
+
+**What it is actually for.** The case that justifies a wait is one where you cannot
+predict the crossing and polling would cost a tool call each time:
+
+- *An orchestrator watching workers.* Background one call watching every worker
+  session and get woken by whichever fills first — the point of per-condition
+  `@targets`.
+- *Rate limits.* These move through other sessions' activity and through window
+  resets, both invisible to you. `--usage-below=5 --timeout=6h` waits out a reset.
+
+Watching **your own** context is the weakest case, and worth being honest about: you
+are the only thing growing it, so a plain `cc4a context` at a natural checkpoint
+usually tells you what you need. A background wait is worth it only in long
+autonomous runs, where it replaces repeated polling with a single wake near the
+compaction threshold — one tool call instead of N.
 
 **Composition is built in, because `&&` cannot do it.** `a && b` runs `b` only after
 `a` returns, so two waits chained that way are sequential, not concurrent. Instead
