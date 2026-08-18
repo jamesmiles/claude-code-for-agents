@@ -211,9 +211,27 @@ and `--context-above/below=N`; `cc4a wait --help` carries worked examples for ea
 shape. A context condition may name its own target with
 `@<session-id>`, so one call can watch several sessions at different thresholds;
 a bare `--session=` sets the default for conditions without an `@target`. Exit `0`
-when met, `3` on timeout, `4` when watching your own state from a call that blocks
-it. `--timeout=0s` evaluates once and exits, turning `wait` into a gate:
+when met, `3` when it did not fire, `4` when watching your own state from a call
+that blocks it, `5` when a condition's data went dark. `--timeout=0s` evaluates once
+and exits, turning `wait` into a gate:
 `cc4a wait --usage-below=80 --timeout=0s || echo deferring`.
+
+**An unreadable value is not a false one.** `usage` conditions poll a network
+endpoint, so a watchdog has to distinguish "the limit was never crossed" from "I
+could not see the limit". `wait` never counts unavailable as below-threshold: a
+failure that cannot recover (no credentials, 401/403) exits `1` immediately rather
+than waiting, and a transient one warns on the first poll, keeps trying, then exits
+`5` **inconclusive** after `--unavailable-timeout` (default 10m) saying the threshold
+may have been crossed unobserved. This matters most in the mixed shape
+`--usage-above=85 --context-above=75 --any`, where a dead endpoint would otherwise be
+masked by a healthy condition and the wait would sleep straight through the outage.
+
+**Pipelines eat exit codes.** `cc4a wait ... | head` reports `head`'s status, so a
+gate that did not fire reads as success. Every shell pipeline behaves this way
+(`false | head` is `0` too), but it fails toward "proceed", so use `set -o pipefail`,
+capture `$?` without piping, or read `${PIPESTATUS[0]}` (`$pipestatus[1]` in zsh).
+cc4a deliberately does not warn about this on stdout: the reason to pipe is usually
+`--json`, and a warning in that stream would corrupt what you were parsing.
 
 **What it is actually for.** The case that justifies a wait is one where you cannot
 predict the crossing and polling would cost a tool call each time:

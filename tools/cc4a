@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.8.0"
+VERSION = "0.9.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -28,7 +28,10 @@ Each command takes --json and --help. For both reports at once, run them togethe
 `cc4a usage; cc4a context`.
 
 EXIT CODES
-  0  data reported   1  data unavailable   2  bad invocation
+  0  data reported        1  data unavailable      2  bad invocation
+
+  `wait` adds three more: 3 did not fire, 4 stalled, 5 inconclusive. See
+  `cc4a wait --help`.
 """
 
 CONTEXT_HELP = """cc4a context — this session's context window.
@@ -152,8 +155,29 @@ EXAMPLES
     cc4a wait --usage-below=80 --timeout=0s || echo "quota too high, deferring"
 
 EXIT CODES
-  0 condition met       1 data unavailable    2 bad invocation
-  3 timed out           4 stalled: watching own state from a call that blocks it
+  0  condition met
+  1  cannot be evaluated at all, and will not recover (no credentials, 401/403)
+  2  bad invocation
+  3  did not fire. Covers both "polled once, not met" (--timeout=0s) and "waited
+     the full timeout, never met" — they are the same outcome, and the exit code
+     does not distinguish them. The message does: "timed out after 6s" vs
+     "met after 0s". For a gate, 3 is the normal negative branch, not an error.
+  4  stalled: watching your own state from a call that blocks it (see below)
+  5  inconclusive: a condition's data went unavailable for --unavailable-timeout
+     (default 10m) and its threshold may have been crossed unobserved. NOT the
+     same as "not met" — an unreadable value is not a false one.
+
+PIPELINES EAT EXIT CODES
+  `cc4a wait ... | head` reports head's status, not wait's, so a gate that did not
+  fire reads as success. That is how every shell pipeline behaves — `false | head`
+  is also 0 — but it fails toward "proceed", so it is worth guarding:
+
+    set -o pipefail                        # portable; bash and zsh
+    cc4a wait ... ; rc=$?                  # or just do not pipe
+    cc4a wait ... | jq . ; ${PIPESTATUS[0]}   # bash    ($pipestatus[1] in zsh)
+
+  cc4a does not warn about this itself: the reason to pipe is usually --json, and
+  writing a warning into that stream would corrupt the thing you were parsing.
 
 WATCHING YOUR OWN CONTEXT
   A session's context only advances when a turn completes. If this call is blocking
@@ -528,6 +552,14 @@ def session_status(sid):
 
 WINDOW_KIND = {"five_hour": "session", "seven_day": "weekly_all"}
 
+# A condition whose data is missing for one of these reasons will never recover on
+# its own; anything else (a 5xx, a dropped connection) may be a blip worth riding out.
+PERMANENT_UNAVAILABLE = ("no-oauth-token", "http-401", "http-403", "http-404")
+
+
+def is_permanent(src):
+    return any((src or "").startswith(x) for x in PERMANENT_UNAVAILABLE)
+
 
 def usage_pct(window):
     u = build_usage(None)
@@ -567,7 +599,7 @@ def cmd_wait(argv):
         return 0 if argv else 2
 
     conds, window, sid = [], "five_hour", None
-    mode, timeout_s, interval_s, stall_s = "any", None, None, 300
+    mode, timeout_s, interval_s, stall_s, unavail_s = "any", None, None, 300, 600
     try:
         for a in argv:
             if a.startswith("--window="):
@@ -582,6 +614,8 @@ def cmd_wait(argv):
                 interval_s = parse_duration(a.split("=", 1)[1], 0)
             elif a.startswith("--stall-timeout="):
                 stall_s = parse_duration(a.split("=", 1)[1], 0)
+            elif a.startswith("--unavailable-timeout="):
+                unavail_s = parse_duration(a.split("=", 1)[1], 0)
             elif a == "--all":
                 mode = "all"
             elif a == "--any":
@@ -631,6 +665,7 @@ def cmd_wait(argv):
               "after %s rather than hanging." % fmt_dur(stall_s), file=sys.stderr)
 
     last_own, stalled_since = None, time.time()
+    unavailable_since, warned = {}, set()
     started = time.time()
     print("waiting for %s of: %s  (timeout %s, poll %s)"
           % (mode, ", ".join(describe(c) for c in conds),
@@ -640,6 +675,36 @@ def cmd_wait(argv):
         results = [eval_condition(c) for c in conds]
         state = [{"condition": describe(c), "current": v, "met": bool(m), "source": src}
                  for c, (m, v, src) in zip(conds, results)]
+        # A condition we cannot evaluate is NOT a condition that is false. Treating
+        # "the endpoint is down" as "the limit was never crossed" would make a
+        # watchdog silently sleep through the outage it exists to catch.
+        for i, (m, v, src) in enumerate(results):
+            if m is not None:
+                unavailable_since.pop(i, None)
+                warned.discard(i)
+                continue
+            if is_permanent(src):
+                print("cannot evaluate %s: %s. This will not recover; not waiting."
+                      % (describe(conds[i]), src), file=sys.stderr)
+                return 1
+            unavailable_since.setdefault(i, time.time())
+            if i not in warned:
+                warned.add(i)
+                print("warning: %s is unavailable (%s) — still polling, will give up "
+                      "after %s" % (describe(conds[i]), src, fmt_dur(unavail_s)),
+                      file=sys.stderr)
+        for i, since in list(unavailable_since.items()):
+            dark = time.time() - since
+            if dark >= unavail_s:
+                out = {"result": "inconclusive", "mode": mode,
+                       "waited_seconds": int(time.time() - started),
+                       "unavailable": describe(conds[i]), "conditions": state}
+                print(json.dumps(out, indent=2) if "--json" in argv else
+                      "inconclusive: %s has been unavailable for %s. Its threshold may "
+                      "have been crossed unobserved." % (describe(conds[i]), fmt_dur(int(dark))),
+                      file=sys.stderr)
+                return 5
+
         met_flags = [m for m, _, _ in results]
         satisfied = (any(met_flags) if mode == "any" else
                      (all(met_flags) and None not in met_flags))
@@ -668,11 +733,6 @@ def cmd_wait(argv):
                     return 4
             else:
                 last_own, stalled_since = own, time.time()
-
-        if all(m is None for m in met_flags):
-            print("data unavailable for every condition (%s)"
-                  % ", ".join(sorted({s["source"] or "?" for s in state})), file=sys.stderr)
-            return 1
 
         if elapsed + interval_s > timeout_s:
             out = {"result": "timeout", "mode": mode, "waited_seconds": int(elapsed),
