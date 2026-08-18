@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -117,6 +117,10 @@ CONDITIONS
   --usage-below=N     5h window at or below N%   (i.e. wait for a reset)
   --context-above=N   a session's context at or above N%
   --context-below=N   a session's context at or below N%
+
+  A session may be given as a full id or any unique prefix — including the 8-char
+  form `cc4a sessions` prints. An id that matches nothing, or more than one session,
+  is rejected before polling starts rather than polled as "unavailable".
 
   Context conditions default to --session=<id>, or this session if that is omitted.
   To watch several sessions at once, name the target on the condition itself:
@@ -557,22 +561,63 @@ def build_usage(sid=None):
                                  w["resets_at"], datetime.timezone.utc).isoformat()
                              if w.get("resets_at") else None})
         if rows:
-            return {"source": "statusline-sidecar", "age_seconds": age, "limits": rows}
+            return {"ok": True, "source": "statusline-sidecar", "age_seconds": age,
+                    "limits": rows}
 
     lim, src = fetch_limits()
     if not lim:
-        return {"source": src, "limits": []}
+        # An empty limits array is not self-evidently a failure: a consumer whose
+        # success test is "did I get valid JSON" will store it as real data. Say so.
+        return {"ok": False, "error": src, "source": src, "limits": []}
     rows = []
     for e in lim.get("limits", []):
         scope = (e.get("scope") or {}).get("model") or {}
         rows.append({"kind": e.get("kind"), "scope": scope.get("display_name"),
                      "used_percentage": e.get("percent"), "severity": e.get("severity"),
                      "resets_at": e.get("resets_at")})
-    return {"source": src, "limits": rows,
+    return {"ok": True, "source": src, "limits": rows,
             "extra_usage_enabled": bool((lim.get("extra_usage") or {}).get("is_enabled"))}
 
 
 # ---------- context ----------
+def known_session_ids():
+    ids = set()
+    for path in glob.glob(os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")):
+        ids.add(os.path.basename(path)[:-6])
+    for path in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
+        try:
+            with open(path) as f:
+                sid = json.load(f).get("sessionId")
+            if sid:
+                ids.add(sid)
+        except Exception:
+            continue
+    return ids
+
+
+def resolve_session(ref):
+    """Full session id from an id or a unique prefix.
+
+    `cc4a sessions` prints 8-character prefixes, so those are the ids a caller has
+    in hand. Accepting one and then reporting it as "unavailable" turns a permanent
+    mistake into what looks like a transient outage — a watch armed on a bad id sits
+    there monitoring nothing. Resolve it, or say so immediately.
+    """
+    if not ref:
+        raise ValueError("empty session id")
+    ids = known_session_ids()
+    if ref in ids:
+        return ref
+    matches = sorted(i for i in ids if i.startswith(ref))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError("unresolvable session id %r — no session on this host starts "
+                         "with it. `cc4a sessions` lists what is available." % ref)
+    raise ValueError("ambiguous session id %r — matches %d sessions: %s"
+                     % (ref, len(matches), ", ".join(m[:12] for m in matches[:4])))
+
+
 def find_transcript(sid):
     hits = glob.glob(os.path.join(HOME, ".claude", "projects", "*", sid + ".jsonl"))
     return hits[0] if hits else None
@@ -779,7 +824,7 @@ def cmd_wait(argv):
                 if window not in WINDOW_KIND:
                     raise ValueError("bad --window %r; use five_hour or seven_day" % window)
             elif a.startswith("--session="):
-                sid = a.split("=", 1)[1]
+                sid = resolve_session(a.split("=", 1)[1])
             elif a.startswith("--timeout="):
                 timeout_s = parse_duration(a.split("=", 1)[1])
             elif a.startswith("--interval="):
@@ -818,9 +863,14 @@ def cmd_wait(argv):
         if c["kind"] == "usage":
             c["window"] = window
             continue
-        c["session"] = c.get("target") or sid or me or ""
-        if not c["session"]:
+        ref = c.get("target") or sid or me or ""
+        if not ref:
             print("--context-* needs --session=<id>", file=sys.stderr)
+            return 2
+        try:
+            c["session"] = resolve_session(ref)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
             return 2
         if c["session"] == me:
             watching_self = True
@@ -864,18 +914,24 @@ def cmd_wait(argv):
             unavailable_since.setdefault(i, time.time())
             if i not in warned:
                 warned.add(i)
-                print("warning: %s is unavailable (%s) — still polling, will give up "
-                      "after %s" % (describe(conds[i]), src, fmt_dur(unavail_s)),
-                      file=sys.stderr)
-        for i, since in list(unavailable_since.items()):
-            dark = time.time() - since
+                others = len(conds) - len(blind)
+                print("warning: %s is unavailable (%s) — %s" % (
+                    describe(conds[i]), src,
+                    "still polling, %d other condition(s) remain readable" % others
+                    if others else "giving up after %s if nothing becomes readable"
+                    % fmt_dur(unavail_s)), file=sys.stderr)
+
+        # Giving up early is only honest when there is nothing left to watch. A
+        # readable condition can still fire — under --any that is the entire point —
+        # so a dead network condition must not take working local ones down with it.
+        if blind and len(blind) == len(conds) and unavailable_since:
+            dark = time.time() - min(unavailable_since.values())
             if dark >= unavail_s:
                 emit_wait({"result": "inconclusive", "mode": mode,
                            "waited_seconds": int(time.time() - started),
-                           "unavailable": [describe(conds[i])], "conditions": state},
-                          "inconclusive: %s has been unavailable for %s. Its threshold "
-                          "may have been crossed unobserved."
-                          % (describe(conds[i]), fmt_dur(int(dark))),
+                           "unavailable": blind, "conditions": state},
+                          "inconclusive: no condition could be read for %s. Thresholds "
+                          "may have been crossed unobserved." % fmt_dur(int(dark)),
                           "--json" in argv, False)
                 return 5
 
@@ -886,7 +942,7 @@ def cmd_wait(argv):
 
         if satisfied:
             emit_wait({"result": "met", "mode": mode, "waited_seconds": int(elapsed),
-                       "conditions": state},
+                       "unavailable": blind, "conditions": state},
                       "met after %s: %s" % (
                           fmt_dur(int(elapsed)) if elapsed >= 60 else "%ds" % int(elapsed),
                           ", ".join("%s (now %.1f%%)" % (s["condition"], s["current"])
@@ -985,8 +1041,16 @@ def build_stats(since_s, by="session"):
     if by not in ("session", "project", "model", "day"):
         raise ValueError("bad --by %r; use session, project, model or day" % by)
     cutoff = time.time() - since_s
-    groups, sessions = {}, set()
+    groups, sessions, seen_messages = {}, set(), set()
     for d, cwd, ts in iter_usage(cutoff):
+        # A message can appear more than once in a transcript; its usage block is the
+        # same reading each time, not additional consumption. Summing every record
+        # inflated output tokens by 150% on a real transcript. First occurrence wins.
+        mid = d.get("message", {}).get("id")
+        if mid is not None:
+            if mid in seen_messages:
+                continue
+            seen_messages.add(mid)
         u = d.get("message", {}).get("usage", {})
         sid = d.get("sessionId") or "?"
         sessions.add(sid)
@@ -1407,7 +1471,11 @@ def cmd_status(argv):
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
-    s = build_status(session_id(argv), local_only="--local" in argv)
+    try:
+        s = build_status(session_id(argv), local_only="--local" in argv)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     print(json.dumps(s, indent=2) if "--json" in argv else human_status(s))
     return 0 if s.get("session_id") else 1
 
@@ -1493,7 +1561,7 @@ def session_id(argv):
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
     for a in argv:
         if a.startswith("--session="):
-            sid = a.split("=", 1)[1]
+            sid = resolve_session(a.split("=", 1)[1])
     return sid
 
 
@@ -1508,7 +1576,11 @@ def cmd_context(argv):
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
-    sid = session_id(argv)
+    try:
+        sid = session_id(argv)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     if not sid:
         print("no session id (set CLAUDE_CODE_SESSION_ID or pass --session=)", file=sys.stderr)
         return 2

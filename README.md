@@ -210,6 +210,11 @@ Scanning is cheap because a file holding messages after time T must have an mtim
 after T, so the window prunes the corpus before any parsing — 5h touched 21 of 116
 files here, and even a 30-day pass over 1GB of transcripts takes ~1.5s.
 
+Repeated `message.id` records are counted once. A transcript can contain the same
+assistant message several times, and its `usage` block is the same reading each time
+rather than additional consumption — summing every record inflated output tokens by
+**151%** on a real transcript here.
+
 **Why it ranks by output.** Each assistant message records four token counts, and
 only three are additive over a session. `cache_read` is the cached prefix re-read on
 *every* turn, so it grows quadratically with session length. Over 7 days on this
@@ -246,8 +251,10 @@ endpoint, so a watchdog has to distinguish "the limit was never crossed" from "I
 could not see the limit". `wait` never counts unavailable as below-threshold: a
 failure that cannot recover (no credentials, 401/403) exits `1` immediately rather
 than waiting, and a transient one warns on the first poll, keeps trying, then exits
-`5` **inconclusive** — either after `--unavailable-timeout` (default 10m), or the
-moment the wait reaches `--timeout` with any condition still unreadable, since
+`5` **inconclusive** — either when *every* condition has been unreadable for
+`--unavailable-timeout` (default 10m), or the moment the wait reaches `--timeout`
+with any condition still unreadable. While even one condition remains readable the
+wait keeps going, so an unreachable endpoint cannot cancel working local conditions, since
 giving up is only honestly "did not fire" if everything was visible at the end.
 With `--json`, `conditions[].met` is `null` and `available` is `false`; branch on
 those. `--json` goes to stdout on every outcome so it stays pipeable. This matters most in the mixed shape

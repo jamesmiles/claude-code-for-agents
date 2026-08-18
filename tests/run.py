@@ -355,6 +355,80 @@ def t_stats_ranking(e):
     assert st["totals"]["cache_read"] == 10_000_010, st["totals"]
 
 
+# ---- reported from the field ------------------------------------------------
+
+@test("an 8-char prefix from `sessions` output resolves")
+def t_prefix_resolves(e):
+    e.transcript(OTHER_SID, tokens=300_000)
+    rc, out, _ = e.run("context", "--session=" + OTHER_SID[:8], "--json")
+    assert rc == 0, rc
+    assert json.loads(out)["session_id"] == OTHER_SID
+
+
+@test("an unresolvable session id fails immediately, not as 'unavailable'")
+def t_unresolvable_fails_fast(e):
+    e.transcript()
+    start = time.time()
+    # Short subprocess timeout: if this regresses the call blocks for hours, and a
+    # suite that hangs is nearly as unhelpful as one that passes wrongly.
+    try:
+        rc, _, err = e.run("wait", "--context-above=75@nosuchid", "--timeout=8h",
+                           timeout=15)
+    except subprocess.TimeoutExpired:
+        raise AssertionError("did not reject the id; an armed watch monitors nothing")
+    assert rc == 2, "exited %s; an armed watch would have monitored nothing" % rc
+    assert "unresolvable session id" in err, err
+    assert time.time() - start < 15, "did not fail fast"
+
+
+@test("an ambiguous session prefix is rejected, not guessed")
+def t_ambiguous_prefix(e):
+    e.transcript("abc11111-0000-0000-0000-000000000000")
+    e.transcript("abc22222-0000-0000-0000-000000000000")
+    rc, _, err = e.run("context", "--session=abc")
+    assert rc == 2, rc
+    assert "ambiguous session id" in err, err
+
+
+@test("one unreadable condition does not abort readable ones")
+def t_blind_does_not_abort(e):
+    e.transcript(OTHER_SID, tokens=100_000)
+    start = time.time()
+    rc, _, _ = e.run("wait", "--usage-above=85", "--context-above=99@" + OTHER_SID,
+                     "--any", "--unavailable-timeout=1s", "--interval=1s", "--timeout=6s")
+    elapsed = time.time() - start
+    assert elapsed >= 5, "gave up after %.1fs; readable conditions were still live" % elapsed
+    assert rc == 5, rc
+
+
+@test("stats counts a repeated message.id once")
+def t_stats_dedupe(e):
+    ns = e.module()
+    path = os.path.join(e.dir, ".claude", "projects", "-fake", "s.jsonl")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    rec = {"type": "assistant", "sessionId": "aaa", "cwd": "/fake", "timestamp": now,
+           "message": {"id": "msg_1", "usage": {
+               "input_tokens": 0, "output_tokens": 1000,
+               "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}}
+    with open(path, "w") as f:
+        for _ in range(3):                       # same message written three times
+            f.write(compact(rec) + "\n")
+    st = ns["build_stats"](3600, "session")
+    assert st["totals"]["output"] == 1000, "summed to %s" % st["totals"]["output"]
+    assert st["rows"][0]["messages"] == 1, st["rows"][0]["messages"]
+
+
+@test("usage --json marks a failure explicitly, not just an empty array")
+def t_usage_json_marks_failure(e):
+    rc, out, _ = e.run("usage", "--json")
+    doc = json.loads(out)
+    assert rc != 0, "throttled read exited 0"
+    assert doc["ok"] is False, doc
+    assert doc.get("error"), doc
+    ok_doc = json.loads(e.run("usage", "--json")[1])   # still throttled, still false
+    assert ok_doc["ok"] is False
+
+
 # ---- runner -----------------------------------------------------------------
 
 SETUP = {
@@ -372,6 +446,9 @@ SETUP = {
     "concurrent callers send one request, not one each": [(200, {}, OK_BODY)],
     "a successful read clears the backoff state": [(429, {}, b""), (200, {}, OK_BODY)],
     "every command rejects an unknown option instead of ignoring it": [(200, {}, OK_BODY)],
+    "an unresolvable session id fails immediately, not as 'unavailable'": [(200, {}, OK_BODY)],
+    "one unreadable condition does not abort readable ones": [(429, {}, b"")],
+    "usage --json marks a failure explicitly, not just an empty array": [(429, {}, b"")],
 }
 
 

@@ -141,6 +141,14 @@ and each assistant line carries both a `timestamp` and a full `usage` object. Th
 is enough to reconstruct per-session, per-project, per-model or per-day token totals
 without any network call.
 
+**A message can appear more than once.** Assistant records are not unique by
+`message.id`: one real transcript held 492 assistant records covering 229 distinct
+ids. The repeated copies carry the same `usage` block, which is a restatement of one
+reading rather than further consumption, so summing every record overstated output
+tokens by 151%. Collapse on `message.id`, first occurrence wins, before summing.
+Point-in-time reads such as "how full is this context" are unaffected, because they
+take the newest record rather than a sum.
+
 Two things make it practical and correct:
 
 **Prune by mtime first.** A file containing a message newer than T must itself have
