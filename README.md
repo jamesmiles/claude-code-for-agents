@@ -12,7 +12,10 @@ are meant to be run by Claude mid-task, not read by a human on a dashboard.
 curl -fsSL https://raw.githubusercontent.com/jamesmiles/claude-code-for-agents/main/install.sh | bash
 ```
 
-Copies `cc4a` into `~/.claude/tools/`; update later with `cc4a update`.
+Copies `cc4a` into `~/.claude/tools/` and, if that is not on your `PATH`, links it
+into the first writable directory that is (`~/.local/bin`, `~/bin`, `/usr/local/bin`
+— or `CC4A_BIN`). If none qualifies it prints the `export PATH=` line to add. Update
+later with `cc4a update`.
 
 If you would rather read the code before running it — a fair instinct for anything
 that touches your OAuth token — clone and install from there instead:
@@ -26,9 +29,14 @@ From a clone the installer symlinks rather than copies, so `git pull` updates in
 place. `./install.sh --copy` forces a copy. Or skip the installer entirely — these
 are standalone scripts, runnable from wherever you cloned them.
 
-Both paths honour `CC4A_DEST` (install directory) and `CC4A_REF` (branch or tag).
+Both paths honour `CC4A_DEST` (install directory), `CC4A_BIN` (the `PATH` directory
+to link into) and `CC4A_REF` (branch or tag).
+
 The installer refuses to write anything that does not look like cc4a, so a 404 page
-or a truncated download cannot land as an executable.
+or a truncated download cannot land as an executable. It also refuses to replace an
+existing **symlink** that points somewhere else — that is usually a clone you develop
+in, and overwriting it with a copy silently detaches your edits from what actually
+runs. Pass `--force` if replacing it is what you want.
 
 ## Tools
 
