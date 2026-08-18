@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
-"""cc-budget — let a Claude Code agent read its own context window + account rate limits."""
+"""cc4a — claude-code-for-agents: tools an agent can run to inspect its own session."""
 import json, os, subprocess, sys, time, glob, urllib.request, urllib.error
 
 
-HELP = """cc-budget — read this session's context window and account rate limits.
+ROOT_HELP = """cc4a — claude-code-for-agents.
+
+Tools a Claude Code agent can run to inspect its own session. Each subcommand has
+its own --help explaining how to read the output and what to do about it.
 
 USAGE
-  cc-budget              human-readable summary
-  cc-budget --json       machine-readable, for hooks and scripts
-  cc-budget --help       this text
-  cc-budget --statusline sidecar mode: consumes Claude Code's statusline JSON on
-                         stdin, caches it, prints a status line
+  cc4a <command> [options]
+  cc4a --help
+
+COMMANDS
+  budget    read this session's context window and account rate limits
+"""
+
+BUDGET_HELP = """cc4a budget — read this session's context window and account rate limits.
+
+USAGE
+  cc4a budget              human-readable summary
+  cc4a budget --json       machine-readable, for hooks and scripts
+  cc4a budget --statusline sidecar mode: consumes Claude Code's statusline JSON on
+                           stdin, caches it, prints a status line
 
 READING THE OUTPUT
   CONTEXT       this session's context window.
@@ -260,22 +272,38 @@ def statusline_mode():
     return 0
 
 
-def main():
-    if "--help" in sys.argv or "-h" in sys.argv:
-        print(HELP)
+def cmd_budget(argv):
+    if "--help" in argv or "-h" in argv:
+        print(BUDGET_HELP)
         return 0
-    if "--statusline" in sys.argv:
+    if "--statusline" in argv:
         return statusline_mode()
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
-    for a in sys.argv[1:]:
+    for a in argv:
         if a.startswith("--session="):
             sid = a.split("=", 1)[1]
     if not sid:
         print("no session id (set CLAUDE_CODE_SESSION_ID or pass --session=)", file=sys.stderr)
         return 1
     r = build(sid)
-    print(json.dumps(r, indent=2) if "--json" in sys.argv else human(r))
+    print(json.dumps(r, indent=2) if "--json" in argv else human(r))
     return 0
+
+
+COMMANDS = {"budget": cmd_budget}
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("--help", "-h", "help"):
+        print(ROOT_HELP)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd not in COMMANDS:
+        print("unknown command: %s\n" % cmd, file=sys.stderr)
+        print(ROOT_HELP, file=sys.stderr)
+        return 2
+    return COMMANDS[cmd](rest)
 
 
 if __name__ == "__main__":

@@ -20,9 +20,9 @@ done
 
 cat <<MSG
 
-Done. Try:  $DEST/cc-budget
+Done. Try:  $DEST/cc4a --help
 
 These are plain scripts — nothing is registered with Claude Code and no context is
-consumed until one is run. To let Claude reach for cc-budget on its own, add a line
+consumed until one is run. To let Claude reach for these on its own, add a line
 to your CLAUDE.md; see the README section "Making an agent aware of a tool".
 MSG

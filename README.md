@@ -18,10 +18,21 @@ Design rules for anything in here:
 
 ## Tools
 
-### `cc-budget` — read your own context window and rate limits
+Everything is reached through one command, so an agent has one name to remember and
+`cc4a --help` to discover the rest:
 
 ```
-$ cc-budget
+$ cc4a
+COMMANDS
+  budget    read this session's context window and account rate limits
+```
+
+Each subcommand carries its own `--help`.
+
+### `cc4a budget` — read your own context window and rate limits
+
+```
+$ cc4a budget
 CONTEXT  [##..................]   8.3%  82,572 / 1,000,000 tokens  (claude-opus-5, via transcript)
          note: reflects the last completed turn; current turn is not yet written
 session                  [#...................]   4.0%  resets in 3h21m
@@ -29,13 +40,13 @@ weekly_all               [########............]  40.0%  resets in 2h31m
 weekly_scoped (Fable)    [#####...............]  24.0%  resets in 2h31m
 ```
 
-`--json` emits the same data machine-readably, for hooks or workflow gating.
-`--help` explains how to read the output and what to do about it — written for an
-agent, so a model that runs the tool cold can interpret the result without you
-having to pre-load any of that into its context.
+`cc4a budget --json` emits the same data machine-readably, for hooks or workflow
+gating. `cc4a budget --help` explains how to read the output and what to do about
+it — written for an agent, so a model that runs the tool cold can interpret the
+result without you having to pre-load any of that into its context.
 
 Context and rate limits live in different places and neither source has both, so
-`cc-budget` joins them:
+`cc4a budget` joins them:
 
 - **Context window** — from the session transcript, located via
   `$CLAUDE_CODE_SESSION_ID`. Accurate as of the last *completed* turn.
@@ -45,13 +56,13 @@ Context and rate limits live in different places and neither source has both, so
 
 The transcript lags by one turn. Claude Code's statusline receives an exact live
 payload — including rate limits — but its output goes to the UI, where the agent
-can't read it. So run `cc-budget` *as* your statusline: it caches the payload to
-disk keyed by session ID, prints a normal status line, and subsequent `cc-budget`
+can't read it. So run `cc4a budget` *as* your statusline: it caches the payload to
+disk keyed by session ID, prints a normal status line, and subsequent `cc4a budget`
 calls read exact numbers with no network call.
 
 ```jsonc
 // ~/.claude/settings.json
-{ "statusLine": { "type": "command", "command": "~/.claude/tools/cc-budget --statusline" } }
+{ "statusLine": { "type": "command", "command": "~/.claude/tools/cc4a budget --statusline" } }
 ```
 
 Note that configuring any custom statusline suppresses some built-in footer hints.
@@ -73,16 +84,18 @@ A script the agent doesn't know about is a script the agent won't run. The cheap
 way to fix that is one line in your `CLAUDE.md`:
 
 ```md
-Run `~/.claude/tools/cc-budget` to check remaining context window and rate limits.
+`~/.claude/tools/cc4a` provides tools for inspecting this session; run it with
+`--help` to see them. `cc4a budget` reports remaining context window and rate limits.
 ```
 
-That's a handful of tokens, and the tool's own `--help` carries the rest, so nothing
-further sits in context. Deliberately *not* shipped here:
+That's a couple of dozen tokens, and it keeps working as tools are added, because
+`cc4a --help` enumerates them and each subcommand's own `--help` carries the detail.
+Nothing further sits in context. Deliberately *not* shipped here:
 
 - **A skill** — a skill's name and description load into every session whether or not
   it's ever invoked. That's a poor trade for a tool whose purpose is conserving
   context, and installing one mutates your global skill list as a side effect. Write
-  one yourself if you want it; a skill wrapping `cc-budget` is four lines.
+  one yourself if you want it; a skill wrapping `cc4a budget` is four lines.
 - **An MCP server** — same objection, larger. Tool definitions are standing context.
 
 If you only want it occasionally, add nothing and just ask.
@@ -104,7 +117,7 @@ expensive, use this.
 
 ## Credentials and network
 
-`cc-budget` reads the Claude OAuth token from the macOS keychain
+`cc4a budget` reads the Claude OAuth token from the macOS keychain
 (`Claude Code-credentials`), falling back to `~/.claude/.credentials.json`. It sends
 that token to exactly one host, `api.anthropic.com`, and to no other. Nothing is
 uploaded, phoned home, or written outside `~/.claude/cache/`.
