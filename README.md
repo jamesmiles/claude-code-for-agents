@@ -42,6 +42,7 @@ COMMANDS
   status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
+  stats       token totals per session on this host (local, mirrors /stats)
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 ```
@@ -116,6 +117,42 @@ Every command takes `--json` for hooks and workflow gating, and `--help` written
 an agent — so a model that runs one cold can interpret the result without any of
 that guidance sitting in its context beforehand. Exit codes are `0` data reported,
 `1` data unavailable, `2` bad invocation.
+
+### `cc4a stats` — token totals per session on this host
+
+```
+$ cc4a stats
+last 5h: 4 sessions, 778 messages
+
+SESSION       OUTPUT  SHARE   CACHE-WRITE   MSGS  PROJECT
+e2f2f822     228,732  28.7%       438,877    290  worktree-green-harbor-a623
+331f014e     224,623  28.2%       723,546    191  external-source
+e35bfb83     174,584  21.9%       332,941    109  worktree-clear-cloud-fa8a
+
+totals  output 795,835 · cache-write 1,818,756 · input 1,556
+        cache-read 94,078,998 — re-counted every turn, not additive consumption
+```
+
+Aggregates every transcript on the host. `--by=session` (default), `project`,
+`model`, or `day`; `--since=` takes `<n>m`, `<n>h` or `<n>d` and defaults to `5h`,
+the rate-limit window. The table is the summary form and `--json` the detailed one:
+it returns every row with full session ids, not just the top N.
+
+Scanning is cheap because a file holding messages after time T must have an mtime
+after T, so the window prunes the corpus before any parsing — 5h touched 21 of 116
+files here, and even a 30-day pass over 1GB of transcripts takes ~1.5s.
+
+**Why it ranks by output.** Each assistant message records four token counts, and
+only three are additive over a session. `cache_read` is the cached prefix re-read on
+*every* turn, so it grows quadratically with session length. Over 7 days on this
+machine that was 3.64 **billion** tokens against 8.6M of output — **95.6% of a naive
+total**. Summing all four mostly measures how long your sessions were, not what they
+consumed, so cc4a ranks by `output`, shows `cache-write` beside it, and prints
+`cache-read` separately under a label saying what it is.
+
+**`SHARE` is share of the window, not of your quota.** Anthropic publishes no token
+denominator for the 5h or 7d limits (see `cc4a usage`), so "this session used X% of
+your limit" is not a computable number and cc4a does not imply one.
 
 ### `cc4a update` — install the latest version
 

@@ -117,6 +117,41 @@ The `limit_dollars` / `used_dollars` / `remaining_dollars` fields are `null` on
 subscription plans. **There is no absolute cap to read** — only utilization
 percentage. This is why `/usage` shows percentages too. Don't invent a denominator.
 
+## Aggregating usage across sessions
+
+Every session on the host leaves a transcript under `~/.claude/projects/*/*.jsonl`,
+and each assistant line carries both a `timestamp` and a full `usage` object. That
+is enough to reconstruct per-session, per-project, per-model or per-day token totals
+without any network call.
+
+Two things make it practical and correct:
+
+**Prune by mtime first.** A file containing a message newer than T must itself have
+an mtime newer than T, so `os.stat` rejects most of the corpus before you parse a
+byte. A 5-hour window touched 21 of 116 files on this machine; a 30-day pass over
+1GB still finished in ~1.5s.
+
+**Do not sum the four token counts.** They are not commensurable:
+
+| field | additive? | meaning |
+|---|---|---|
+| `output_tokens` | yes | tokens generated — the truest measure of work |
+| `cache_creation_input_tokens` | yes | context written to cache, paid once |
+| `input_tokens` | yes | uncached input, usually tiny |
+| `cache_read_input_tokens` | **no** | cached prefix re-counted on *every* turn |
+
+`cache_read` grows with the square of session length: a 200-turn session with a 50k
+prefix reports ~10M cache-read tokens having cached 50k once. Measured over 7 days
+here it was 3,640,536,773 tokens against 8,633,260 of output — **95.6% of a naive
+sum**. Any "total tokens used" figure built by adding all four is mostly a proxy for
+session length. Rank by `output`, report the components separately, and label
+`cache_read` for what it is.
+
+Note also that `~/.claude/stats-cache.json` already holds `dailyModelTokens` and a
+`modelUsage` breakdown — but only by day and by model, never by session, and
+`lastComputedDate` typically lags a day behind. Per-session numbers require the scan.
+On subscription plans its `costUSD` fields are `0`, so cost is not a usable ranking.
+
 ## Session and account facts
 
 `~/.claude/sessions/<pid>.json` is written per running process and carries most of

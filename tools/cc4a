@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -18,6 +18,7 @@ COMMANDS
   status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
+  stats       token totals per session on this host (local, mirrors /stats)
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 
@@ -83,6 +84,37 @@ Add to ~/.claude/settings.json:
 
 Note that configuring any custom status line suppresses some built-in footer hints.
 Not meant to be run by hand.
+"""
+
+STATS_HELP = """cc4a stats — token totals for Claude sessions on this host.
+
+USAGE
+  cc4a stats [--since=<dur>] [--by=<dim>] [--top=N] [--json]
+
+  --since=  window, as <n>m / <n>h / <n>d. Default 5h, the rate-limit window.
+  --by=     session (default), project, model, or day
+  --top=    rows to show, default 10. --json always returns every row.
+
+WHAT THE NUMBERS MEAN
+  Four token counts are recorded per assistant message, and only three of them
+  are additive across a session:
+
+    output        tokens generated. The truest measure of work done.
+    cache-write   context written to cache. Real, paid once.
+    input         uncached input. Usually tiny.
+    cache-read    cached prefix re-counted on EVERY turn of the session.
+
+  cache-read dominates any naive total — commonly 90-95% of it — because a long
+  session re-reads the same prefix hundreds of times. Summing all four produces a
+  number that mostly measures session length, not consumption. This tool ranks by
+  output and reports the components separately. Treat any tool quoting one big
+  "tokens used" figure with suspicion.
+
+  Percentages are shares of the window's total, NOT of a rate limit. Anthropic
+  publishes no token denominator for the 5h or 7d windows (see `cc4a usage`), so a
+  session's share of your quota is not a computable number. Do not present it as one.
+
+  Session ids are truncated for display; --json carries them in full.
 """
 
 STATUS_HELP = """cc4a status — session, account and configuration facts.
@@ -333,6 +365,155 @@ def human_usage(u):
             e["kind"] + (" (%s)" % e["scope"] if e["scope"] else ""),
             bar(e["used_percentage"]), e["used_percentage"], resets_in(e.get("resets_at")))
         for e in u["limits"])
+
+
+# ---------- stats ----------
+def parse_duration(text, default_seconds=5 * 3600):
+    if not text:
+        return default_seconds
+    units = {"m": 60, "h": 3600, "d": 86400}
+    try:
+        n, u = int(text[:-1]), text[-1].lower()
+        if u in units and n > 0:
+            return n * units[u]
+    except ValueError:
+        pass
+    raise ValueError("bad duration %r; use <n>m, <n>h or <n>d" % text)
+
+
+def iter_usage(cutoff):
+    """Yield (record, cwd, timestamp) for assistant messages newer than cutoff."""
+    pattern = os.path.join(HOME, ".claude", "projects", "*", "*.jsonl")
+    for path in glob.glob(pattern):
+        try:
+            if os.stat(path).st_mtime < cutoff:
+                continue  # a file holding messages after T must be modified after T
+        except OSError:
+            continue
+        cwd = None
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if '"type":"assistant"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("type") != "assistant":
+                    continue
+                cwd = cwd or d.get("cwd")
+                try:
+                    ts = datetime.datetime.fromisoformat(
+                        d["timestamp"].replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    continue
+                if ts < cutoff:
+                    continue
+                yield d, cwd or os.path.basename(os.path.dirname(path)), ts
+
+
+ZERO = ("output", "cache_write", "input", "cache_read", "messages")
+
+
+def build_stats(since_s, by="session"):
+    if by not in ("session", "project", "model", "day"):
+        raise ValueError("bad --by %r; use session, project, model or day" % by)
+    cutoff = time.time() - since_s
+    groups, sessions = {}, set()
+    for d, cwd, ts in iter_usage(cutoff):
+        u = d.get("message", {}).get("usage", {})
+        sid = d.get("sessionId") or "?"
+        sessions.add(sid)
+        if by == "session":
+            key = sid
+        elif by == "project":
+            key = os.path.basename(cwd.rstrip("/")) if cwd else "?"
+        elif by == "model":
+            key = d.get("message", {}).get("model") or "?"
+        else:
+            key = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        g = groups.setdefault(key, dict.fromkeys(ZERO, 0))
+        g["output"] += u.get("output_tokens", 0)
+        g["cache_write"] += u.get("cache_creation_input_tokens", 0)
+        g["input"] += u.get("input_tokens", 0)
+        g["cache_read"] += u.get("cache_read_input_tokens", 0)
+        g["messages"] += 1
+        g["project"] = os.path.basename(cwd.rstrip("/")) if cwd else "?"
+        g["last_seen"] = max(g.get("last_seen", 0), ts)
+
+    rows = []
+    for key, g in groups.items():
+        row = {"key": key}
+        row.update({k: g[k] for k in ZERO})
+        row["project"] = g.get("project")
+        row["last_seen"] = datetime.datetime.fromtimestamp(
+            g["last_seen"]).isoformat(timespec="seconds") if g.get("last_seen") else None
+        rows.append(row)
+    rows.sort(key=lambda r: r["output"], reverse=True)
+    totals = {k: sum(r[k] for r in rows) for k in ZERO}
+    for r in rows:
+        r["output_share_pct"] = round(100.0 * r["output"] / totals["output"], 1) if totals["output"] else 0.0
+    return {"since_seconds": since_s, "by": by, "sessions": len(sessions),
+            "groups": len(rows), "totals": totals, "rows": rows}
+
+
+def fmt_dur(s):
+    for n, u in ((86400, "d"), (3600, "h"), (60, "m")):
+        if s % n == 0 and s >= n:
+            return "%d%s" % (s // n, u)
+    return "%ds" % s
+
+
+def human_stats(st, top):
+    if not st["rows"]:
+        return "no assistant messages in the last %s" % fmt_dur(st["since_seconds"])
+    t = st["totals"]
+    out = ["last %s: %d sessions, %s messages" % (
+        fmt_dur(st["since_seconds"]), st["sessions"], f"{t['messages']:,}"), ""]
+    label = {"session": "SESSION", "project": "PROJECT", "model": "MODEL", "day": "DAY"}[st["by"]]
+    show = st["rows"][:top]
+    keyw = max([len(label)] + [len(r["key"][:8] if st["by"] == "session" else r["key"]) for r in show])
+    hdr = "%-*s  %10s %6s  %12s %6s" % (keyw, label, "OUTPUT", "SHARE", "CACHE-WRITE", "MSGS")
+    if st["by"] == "session":
+        hdr += "  PROJECT"
+    out.append(hdr)
+    for r in show:
+        k = r["key"][:8] if st["by"] == "session" else r["key"]
+        line = "%-*s  %10s %5.1f%%  %12s %6s" % (
+            keyw, k, f"{r['output']:,}", r["output_share_pct"],
+            f"{r['cache_write']:,}", f"{r['messages']:,}")
+        if st["by"] == "session":
+            line += "  %s" % (r.get("project") or "")
+        out.append(line)
+    if len(st["rows"]) > top:
+        out.append("... %d more (--top=%d, or --json for all)"
+                   % (len(st["rows"]) - top, len(st["rows"])))
+    out += ["", "totals  output %s · cache-write %s · input %s" % (
+        f"{t['output']:,}", f"{t['cache_write']:,}", f"{t['input']:,}"),
+        "        cache-read %s — re-counted every turn, not additive consumption"
+        % f"{t['cache_read']:,}"]
+    return "\n".join(out)
+
+
+def cmd_stats(argv):
+    if "--help" in argv or "-h" in argv:
+        print(STATS_HELP)
+        return 0
+    since, by, top = None, "session", 10
+    for a in argv:
+        if a.startswith("--since="):
+            since = a.split("=", 1)[1]
+        elif a.startswith("--by="):
+            by = a.split("=", 1)[1]
+        elif a.startswith("--top="):
+            top = int(a.split("=", 1)[1])
+    try:
+        st = build_stats(parse_duration(since), by)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    print(json.dumps(st, indent=2) if "--json" in argv else human_stats(st, top))
+    return 0 if st["rows"] else 1
 
 
 # ---------- status ----------
@@ -624,7 +805,7 @@ def cmd_statusline(argv):
     return 0
 
 
-COMMANDS = {"status": cmd_status, "context": cmd_context, "usage": cmd_usage,
+COMMANDS = {"status": cmd_status, "stats": cmd_stats, "context": cmd_context, "usage": cmd_usage,
             "statusline": cmd_statusline, "update": cmd_update}
 
 
