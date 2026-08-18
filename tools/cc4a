@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -94,6 +94,7 @@ USAGE
 
   Durations are <n>s / <n>m / <n>h / <n>d. Default timeout 1h; default poll 60s
   when any usage condition is present (its data is cached for 60s), else 5s.
+  --timeout=0s evaluates once and exits, which turns wait into a gate.
 
 CONDITIONS
   --usage-above=N     5h window at or above N%   (--window=seven_day for weekly)
@@ -114,8 +115,44 @@ CONDITIONS
   two concurrent waits would, without the shell juggling. `a && b` cannot: && runs
   b only after a returns.
 
+EXAMPLES
+  Self-watch on context. Wake me before auto-compaction chooses for me, so I can
+  checkpoint deliberately. A bare condition targets this session:
+
+    cc4a wait --context-above=75 --timeout=8h --interval=30s
+
+  Self-watch on the rate limit. Wake me when the 5h window is nearly spent, before
+  I start anything expensive:
+
+    cc4a wait --usage-above=85 --timeout=5h
+
+  Both at once — whichever comes first. This is the useful shape for a long
+  autonomous run, and is what `a && b` cannot express:
+
+    cc4a wait --context-above=75 --usage-above=85 --any --timeout=8h
+
+  BOTH of the above MUST be started with run_in_background. Blocking your own turn
+  freezes your own context and holds your own token spend flat, so neither
+  threshold can arrive; you get exit 4 after --stall-timeout instead of a hang.
+  Backgrounded, your turn completes normally and Claude Code re-invokes you when
+  the command exits — that wake-up is the whole point.
+
+  Wait out a rate-limit window instead. Here nothing depends on your own turns, so
+  blocking is fine — but the 600s foreground cap still means backgrounding it:
+
+    cc4a wait --usage-below=5 --timeout=6h --interval=5m
+
+  Orchestrator watching workers. Wake on whichever session fills first:
+
+    cc4a wait --context-above=80@<worker-a> --context-above=80@<worker-b> --any
+
+  Gate a script on quota, no waiting. --timeout=0s polls once and exits:
+
+    cc4a wait --usage-below=80 --timeout=0s || echo "quota too high, deferring"
+
 EXIT CODES
-  0 condition met   1 data unavailable   2 bad invocation   3 timed out
+  0 condition met       1 data unavailable    2 bad invocation
+  3 timed out           4 stalled: watching own state from a call that blocks it
 
 WATCHING YOUR OWN CONTEXT
   A session's context only advances when a turn completes. If this call is blocking
@@ -590,7 +627,7 @@ def parse_duration(text, default_seconds=5 * 3600):
     units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     try:
         n, u = int(text[:-1]), text[-1].lower()
-        if u in units and n > 0:
+        if u in units and n >= 0:
             return n * units[u]
     except ValueError:
         pass

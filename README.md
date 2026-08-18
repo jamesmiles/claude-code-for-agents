@@ -176,10 +176,13 @@ cc4a wait --context-above=80@<worker-a> --context-above=80@<worker-b> --any
 ```
 
 Conditions are `--usage-above/below=N` (add `--window=seven_day` for the weekly cap)
-and `--context-above/below=N`. A context condition may name its own target with
+and `--context-above/below=N`; `cc4a wait --help` carries worked examples for each
+shape. A context condition may name its own target with
 `@<session-id>`, so one call can watch several sessions at different thresholds;
 a bare `--session=` sets the default for conditions without an `@target`. Exit `0`
-when met, `3` on timeout.
+when met, `3` on timeout, `4` when watching your own state from a call that blocks
+it. `--timeout=0s` evaluates once and exits, turning `wait` into a gate:
+`cc4a wait --usage-below=80 --timeout=0s || echo deferring`.
 
 **What it is actually for.** The case that justifies a wait is one where you cannot
 predict the crossing and polling would cost a tool call each time:
