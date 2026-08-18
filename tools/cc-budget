@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""cc-budget — let a Claude Code agent read its own context window + account rate limits."""
+import json, os, subprocess, sys, time, glob, urllib.request, urllib.error
+
+
+HELP = """cc-budget — read this session's context window and account rate limits.
+
+USAGE
+  cc-budget              human-readable summary
+  cc-budget --json       machine-readable, for hooks and scripts
+  cc-budget --help       this text
+  cc-budget --statusline sidecar mode: consumes Claude Code's statusline JSON on
+                         stdin, caches it, prints a status line
+
+READING THE OUTPUT
+  CONTEXT       this session's context window.
+                "via transcript" reflects the last *completed* turn, so it lags the
+                current turn by one. "via statusline-sidecar" is exact and live.
+  session       the rolling 5-hour window. At 100% work blocks until it resets.
+  weekly_all    the 7-day cap across all models.
+  weekly_scoped the 7-day cap for one model, named in parentheses.
+
+  Percentages are all Anthropic reports — there is no absolute cap to read, so
+  "4%" has no published denominator. If limits show "unavailable", the account
+  uses an API key rather than a Pro/Max subscription, or the undocumented
+  endpoint changed. Report that as unknown; never estimate.
+
+IF YOU ARE AN AGENT RUNNING THIS
+  Context above ~75%: finish the current thread and suggest /compact, or hand the
+  work to a subagent so the bulk of the reading stays out of your context.
+  5-hour window above ~80%: say so before starting an expensive fan-out and let
+  the user decide whether to proceed or wait for the reset.
+  Do not silently scale work down because a budget looks tight. State the number
+  and the tradeoff, then do what was asked.
+"""
+
+HOME = os.path.expanduser("~")
+CACHE = os.path.join(HOME, ".claude", "cache")
+LIMITS_CACHE = os.path.join(CACHE, "budget-limits.json")
+LIMITS_TTL = 60
+USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+
+def sidecar_path(sid):
+    return os.path.join(CACHE, "budget-statusline-%s.json" % sid)
+
+
+# ---------- oauth token ----------
+def oauth_token():
+    if sys.platform == "darwin":
+        try:
+            raw = subprocess.run(
+                ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+                capture_output=True, text=True, timeout=5).stdout
+            tok = json.loads(raw).get("claudeAiOauth", {}).get("accessToken")
+            if tok:
+                return tok
+        except Exception:
+            pass
+    try:
+        with open(os.path.join(HOME, ".claude", ".credentials.json")) as f:
+            return json.load(f).get("claudeAiOauth", {}).get("accessToken")
+    except Exception:
+        return None
+
+
+# ---------- account-level limits ----------
+def fetch_limits():
+    try:
+        st = os.stat(LIMITS_CACHE)
+        if time.time() - st.st_mtime < LIMITS_TTL:
+            with open(LIMITS_CACHE) as f:
+                return json.load(f), "cache"
+    except Exception:
+        pass
+    tok = oauth_token()
+    if not tok:
+        return None, "no-oauth-token"
+    req = urllib.request.Request(USAGE_URL, headers={
+        "Authorization": "Bearer " + tok,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": "cc-budget",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+    except urllib.error.HTTPError as e:
+        return None, "http-%d" % e.code
+    except Exception as e:
+        return None, "error-%s" % type(e).__name__
+    os.makedirs(CACHE, exist_ok=True)
+    tmp = LIMITS_CACHE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f)
+    os.replace(tmp, LIMITS_CACHE)
+    return data, "live"
+
+
+# ---------- per-session context window ----------
+def find_transcript(sid):
+    hits = glob.glob(os.path.join(HOME, ".claude", "projects", "*", sid + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def context_from_sidecar(sid):
+    try:
+        st = os.stat(sidecar_path(sid))
+        if time.time() - st.st_mtime > 900:
+            return None
+        with open(sidecar_path(sid)) as f:
+            d = json.load(f)
+    except Exception:
+        return None
+    cw = d.get("context_window") or {}
+    if not cw.get("context_window_size"):
+        return None
+    cu = cw.get("current_usage") or {}
+    used = (cu.get("input_tokens", 0) + cu.get("cache_read_input_tokens", 0)
+            + cu.get("cache_creation_input_tokens", 0)) or cw.get("total_input_tokens", 0)
+    return {
+        "source": "statusline-sidecar",
+        "used_tokens": used,
+        "window_size": cw["context_window_size"],
+        "used_percentage": cw.get("used_percentage"),
+        "model": (d.get("model") or {}).get("display_name"),
+        "age_seconds": int(time.time() - st.st_mtime),
+    }
+
+
+def context_from_transcript(sid):
+    path = find_transcript(sid)
+    if not path:
+        return {"source": "unavailable", "error": "no transcript for session %s" % sid}
+    last = None
+    with open(path, errors="replace") as f:
+        for line in f:
+            if '"type":"assistant"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("type") == "assistant" and not d.get("isSidechain"):
+                last = d
+    if not last:
+        return {"source": "unavailable", "error": "no assistant turn yet"}
+    u = last["message"].get("usage", {})
+    used = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+            + u.get("cache_creation_input_tokens", 0))
+    return {
+        "source": "transcript",
+        "used_tokens": used,
+        "window_size": window_size_guess(),
+        "model": last["message"].get("model"),
+        "transcript": path,
+        "note": "reflects the last completed turn; current turn is not yet written",
+    }
+
+
+def window_size_guess():
+    for p in (os.path.join(HOME, ".claude", "settings.local.json"),
+              os.path.join(HOME, ".claude", "settings.json")):
+        try:
+            with open(p) as f:
+                m = json.load(f).get("model", "")
+            if "[1m]" in m:
+                return 1_000_000
+            if m:
+                return 200_000
+        except Exception:
+            continue
+    return 200_000
+
+
+def get_context(sid):
+    return context_from_sidecar(sid) or context_from_transcript(sid)
+
+
+# ---------- report ----------
+def build(sid):
+    ctx = get_context(sid)
+    if ctx.get("used_tokens") and ctx.get("window_size"):
+        ctx.setdefault("used_percentage", round(100.0 * ctx["used_tokens"] / ctx["window_size"], 1))
+        ctx["remaining_tokens"] = ctx["window_size"] - ctx["used_tokens"]
+    lim, lim_src = fetch_limits()
+    out = {"session_id": sid, "context": ctx, "limits_source": lim_src, "limits": []}
+    if lim:
+        for e in lim.get("limits", []):
+            scope = (e.get("scope") or {}).get("model") or {}
+            out["limits"].append({
+                "kind": e.get("kind"),
+                "scope": scope.get("display_name"),
+                "used_percentage": e.get("percent"),
+                "severity": e.get("severity"),
+                "resets_at": e.get("resets_at"),
+            })
+        eu = lim.get("extra_usage") or {}
+        out["extra_usage_enabled"] = bool(eu.get("is_enabled"))
+    return out
+
+
+def bar(pct, width=20):
+    pct = max(0.0, min(100.0, float(pct or 0)))
+    n = int(round(pct / 100 * width))
+    return "[" + "#" * n + "." * (width - n) + "]"
+
+
+def human(r):
+    L = []
+    c = r["context"]
+    if c.get("used_tokens"):
+        L.append("CONTEXT  %s %5.1f%%  %s / %s tokens  (%s, via %s)" % (
+            bar(c["used_percentage"]), c["used_percentage"],
+            f"{c['used_tokens']:,}", f"{c['window_size']:,}",
+            c.get("model") or "?", c["source"]))
+        if c.get("note"):
+            L.append("         note: " + c["note"])
+    else:
+        L.append("CONTEXT  unavailable (%s)" % c.get("error", "?"))
+    if r["limits"]:
+        now = time.time()
+        for e in r["limits"]:
+            label = e["kind"] + (" (%s)" % e["scope"] if e["scope"] else "")
+            rs = ""
+            if e.get("resets_at"):
+                try:
+                    import datetime
+                    t = datetime.datetime.fromisoformat(e["resets_at"]).timestamp()
+                    d = t - now
+                    rs = "  resets in %dh%02dm" % (d // 3600, (d % 3600) // 60) if d > 0 else "  resets now"
+                except Exception:
+                    pass
+            L.append("%-24s %s %5.1f%%%s" % (label, bar(e["used_percentage"]), e["used_percentage"], rs))
+    else:
+        L.append("LIMITS   unavailable (%s)" % r["limits_source"])
+    return "\n".join(L)
+
+
+def statusline_mode():
+    try:
+        d = json.load(sys.stdin)
+    except Exception:
+        return 0
+    sid = d.get("session_id")
+    if sid:
+        os.makedirs(CACHE, exist_ok=True)
+        tmp = sidecar_path(sid) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, sidecar_path(sid))
+    cw = d.get("context_window") or {}
+    rl = d.get("rate_limits") or {}
+    parts = [(d.get("model") or {}).get("display_name", "")]
+    if cw.get("used_percentage") is not None:
+        parts.append("ctx %d%%" % cw["used_percentage"])
+    for k, lbl in (("five_hour", "5h"), ("seven_day", "7d")):
+        if (rl.get(k) or {}).get("used_percentage") is not None:
+            parts.append("%s %d%%" % (lbl, rl[k]["used_percentage"]))
+    print(" | ".join(p for p in parts if p))
+    return 0
+
+
+def main():
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(HELP)
+        return 0
+    if "--statusline" in sys.argv:
+        return statusline_mode()
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    for a in sys.argv[1:]:
+        if a.startswith("--session="):
+            sid = a.split("=", 1)[1]
+    if not sid:
+        print("no session id (set CLAUDE_CODE_SESSION_ID or pass --session=)", file=sys.stderr)
+        return 1
+    r = build(sid)
+    print(json.dumps(r, indent=2) if "--json" in sys.argv else human(r))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
