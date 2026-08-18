@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -15,6 +15,7 @@ USAGE
   cc4a <command> [options]
 
 COMMANDS
+  sessions    every Claude session on this host    (status, context, last active)
   status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
@@ -169,6 +170,40 @@ LONG WAITS MUST RUN IN THE BACKGROUND
   notably waiting out a 5-hour window — must be started with run_in_background.
   The agent is re-invoked when the command exits, which is exactly the wakeup you
   want. Default timeout is 1h; raise it with --timeout for a full-window wait.
+"""
+
+SESSIONS_HELP = """cc4a sessions — every Claude Code session on this host.
+
+USAGE
+  cc4a sessions [--active] [--json] [--top=N]
+
+  --active  only sessions whose turn is in flight or awaiting input (busy/waiting)
+  --top=    rows to show, newest activity first. Default 20; --json returns all.
+
+COLUMNS
+  STATUS    busy    a turn is in flight
+            waiting waiting on the user
+            idle    neither
+  LAST      how long since the session's transcript was last written — the truest
+            "last did something" signal, since the record's own updatedAt only
+            moves on state transitions.
+  CONTEXT   that session's context window usage, read from the tail of its
+            transcript. Cheap even for a 100MB+ log.
+            A leading ~ means the window size is assumed, not known: a session's
+            own window is recorded nowhere readable, so above 200k tokens it must
+            be the 1M window, but below that all cc4a has is this machine's
+            configured model — right for your own session, a guess for others.
+            The token count is exact either way.
+
+  Sessions whose process is no longer running are dropped; --json reports them
+  with "alive": false rather than hiding them silently.
+
+IF YOU ARE AN AGENT RUNNING THIS
+  This is how you discover the ids that `cc4a wait` and `cc4a context --session=`
+  need. To be woken when whichever busy worker fills up first:
+
+    cc4a sessions --active --json   # take the ids you care about, then
+    cc4a wait --context-above=80@<id-a> --context-above=80@<id-b> --any
 """
 
 STATS_HELP = """cc4a stats — token totals for Claude sessions on this host.
@@ -365,6 +400,38 @@ def window_size_guess():
     return 200_000
 
 
+def last_assistant_record(path, chunk=262144, max_bytes=8 * 1024 * 1024):
+    """Last non-sidechain assistant record, read backwards from EOF.
+
+    Transcripts reach tens of megabytes; the record we want is almost always in
+    the final few KB, so scanning the whole file to find it is pure waste.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    with open(path, "rb") as fh:
+        tail, pos = b"", size
+        while pos > 0 and size - pos < max_bytes:
+            step = min(chunk, pos)
+            pos -= step
+            fh.seek(pos)
+            tail = fh.read(step) + tail
+            lines = tail.split(b"\n")
+            # the first element may be a partial line unless we reached the start
+            start = 0 if pos == 0 else 1
+            for raw in reversed(lines[start:]):
+                if b'"type":"assistant"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw.decode("utf-8", "replace"))
+                except Exception:
+                    continue
+                if d.get("type") == "assistant" and not d.get("isSidechain"):
+                    return d
+    return None
+
+
 def build_context(sid):
     d, age = read_sidecar(sid)
     cw = (d or {}).get("context_window") or {}
@@ -381,25 +448,24 @@ def build_context(sid):
     path = find_transcript(sid)
     if not path:
         return {"source": "unavailable", "error": "no transcript for session %s" % sid}
-    last = None
-    with open(path, errors="replace") as f:
-        for line in f:
-            if '"type":"assistant"' not in line:
-                continue
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if r.get("type") == "assistant" and not r.get("isSidechain"):
-                last = r
+    last = last_assistant_record(path)
     if not last:
         return {"source": "unavailable", "error": "no completed assistant turn yet"}
     u = last["message"].get("usage", {})
+    used = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+            + u.get("cache_creation_input_tokens", 0))
+    # A session's own window is not recorded anywhere we can read. Above 200k the
+    # answer is forced; below it, all we have is this machine's configured model,
+    # which is only the right answer for our own session.
+    if used > 200_000:
+        window, wsrc = 1_000_000, "inferred"
+    else:
+        window, wsrc = window_size_guess(), "assumed"
     return finish_context({
         "source": "transcript",
-        "used_tokens": (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
-                        + u.get("cache_creation_input_tokens", 0)),
-        "window_size": window_size_guess(),
+        "used_tokens": used,
+        "window_size": window,
+        "window_source": wsrc,
         "model": last["message"].get("model"),
         "transcript": path,
         "note": "reflects the last completed turn; current turn is not yet written",
@@ -769,6 +835,121 @@ def cmd_stats(argv):
     return 0 if st["rows"] else 1
 
 
+# ---------- sessions ----------
+def live_pids(pids):
+    """Which of these pids are running Claude Code right now."""
+    if not pids:
+        return set()
+    try:
+        out = subprocess.run(["ps", "-o", "pid=,comm=", "-p", ",".join(str(p) for p in pids)],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return set(pids)  # cannot tell; assume alive rather than hide sessions
+    out_pids = set()
+    for line in out.strip().splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2 and "claude" in parts[1]:
+            out_pids.add(int(parts[0]))
+    return out_pids
+
+
+def ago(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh%02dm" % (seconds // 3600, (seconds % 3600) // 60)
+    return "%dd" % (seconds // 86400)
+
+
+def build_sessions(active_only=False):
+    recs = []
+    for f in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
+        try:
+            with open(f) as fh:
+                recs.append(json.load(fh))
+        except Exception:
+            continue
+    alive = live_pids([r.get("pid") for r in recs if r.get("pid")])
+
+    now, rows = time.time(), []
+    for r in recs:
+        sid = r.get("sessionId")
+        if not sid:
+            continue
+        path = find_transcript(sid)
+        last = os.path.getmtime(path) if path and os.path.exists(path) else None
+        ctx = build_context(sid) if path else {}
+        rows.append({
+            "session_id": sid,
+            "pid": r.get("pid"),
+            "alive": r.get("pid") in alive,
+            "status": r.get("status"),
+            "kind": r.get("kind"),
+            "entrypoint": r.get("entrypoint"),
+            "name": r.get("name"),
+            "cwd": r.get("cwd"),
+            "version": r.get("version"),
+            "started_at": r.get("procStart"),
+            "last_active": datetime.datetime.fromtimestamp(last).isoformat(timespec="seconds")
+                           if last else None,
+            "last_active_seconds_ago": int(now - last) if last else None,
+            "transcript": path,
+            "transcript_bytes": os.path.getsize(path) if path and os.path.exists(path) else None,
+            "context_used_percentage": ctx.get("used_percentage"),
+            "context_window_source": ctx.get("window_source"),
+            "context_used_tokens": ctx.get("used_tokens"),
+            "context_window_size": ctx.get("window_size"),
+            "model": ctx.get("model"),
+            "is_self": sid == os.environ.get("CLAUDE_CODE_SESSION_ID"),
+        })
+    if active_only:
+        rows = [r for r in rows if r["status"] in ("busy", "waiting")]
+    rows.sort(key=lambda r: r["last_active_seconds_ago"] if r["last_active_seconds_ago"]
+              is not None else 1 << 40)
+    return rows
+
+
+def human_sessions(rows, top):
+    live = [r for r in rows if r["alive"]]
+    if not live:
+        return "no live Claude sessions found"
+    show = live[:top]
+    namew = max([4] + [len(r["name"] or "") for r in show])
+    out = ["%d live sessions" % len(live), "",
+           "%-8s %-8s %7s %6s  %-*s  %s" % ("STATUS", "SESSION", "CONTEXT", "LAST", namew, "NAME", "CWD")]
+    for r in show:
+        pct = ("%s%.1f%%" % ("~" if r.get("context_window_source") == "assumed" else "",
+                             r["context_used_percentage"])
+               if r["context_used_percentage"] is not None else "-")
+        last = ago(r["last_active_seconds_ago"]) if r["last_active_seconds_ago"] is not None else "-"
+        cwd = (r["cwd"] or "").replace(HOME, "~")
+        out.append("%-8s %-8s %7s %6s  %-*s  %s%s" % (
+            r["status"] or "?", r["session_id"][:8], pct, last, namew, r["name"] or "", cwd,
+            "   <- this session" if r["is_self"] else ""))
+    if len(live) > top:
+        out.append("... %d more (--top=%d, or --json for all)" % (len(live) - top, len(live)))
+    return "\n".join(out)
+
+
+def cmd_sessions(argv):
+    if "--help" in argv or "-h" in argv:
+        print(SESSIONS_HELP)
+        return 0
+    top = 20
+    for a in argv:
+        if a.startswith("--top="):
+            top = int(a.split("=", 1)[1])
+    rows = build_sessions(active_only="--active" in argv)
+    if "--json" in argv:
+        print(json.dumps({"sessions": rows}, indent=2))
+    else:
+        print(human_sessions(rows, top))
+    return 0 if any(r["alive"] for r in rows) else 1
+
+
 # ---------- status ----------
 PROFILE_CACHE = os.path.join(CACHE, "cc4a-profile.json")
 PROFILE_TTL = 86400
@@ -1058,7 +1239,7 @@ def cmd_statusline(argv):
     return 0
 
 
-COMMANDS = {"status": cmd_status, "stats": cmd_stats, "wait": cmd_wait, "context": cmd_context, "usage": cmd_usage,
+COMMANDS = {"sessions": cmd_sessions, "status": cmd_status, "stats": cmd_stats, "wait": cmd_wait, "context": cmd_context, "usage": cmd_usage,
             "statusline": cmd_statusline, "update": cmd_update}
 
 

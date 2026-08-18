@@ -50,6 +50,7 @@ same thing — no new vocabulary to learn or to put in an agent's context.
 ```
 $ cc4a
 COMMANDS
+  sessions    every Claude session on this host    (status, context, last active)
   status      session, account and config facts    (mirrors /status)
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
@@ -58,6 +59,36 @@ COMMANDS
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 ```
+
+### `cc4a sessions` — every Claude session on this host
+
+```
+$ cc4a sessions --active
+3 live sessions
+
+STATUS   SESSION  CONTEXT   LAST  NAME                          CWD
+busy     e35bfb83   35.9%    21s  worktree-clear-cloud-fa8a-10  ~/.herdr/worktrees/ppz/...
+busy     331f014e   25.9%    21s  external-source-c4            ~/external-source   <- this session
+busy     f6425131   97.2%    11m  worktree-rapid-field-f116-92  ~/.herdr/worktrees/pixel-studios/...
+```
+
+This is the discovery step the other commands need: it hands you the session ids
+that `cc4a wait --context-above=80@<id>` and `cc4a context --session=<id>` take.
+`--active` narrows to sessions whose turn is in flight or awaiting input.
+
+`LAST` is the age of the session's **transcript** — the truest "last did something"
+signal, since a session record's own `updatedAt` only moves on state transitions.
+
+It stays fast on real machines by reading each transcript **backwards from EOF**
+rather than parsing it. The record it needs is in the last few KB, so a 143MB log
+resolves in ~1ms and all 41 sessions here list in 0.2s. `cc4a context` uses the same
+reader.
+
+A leading `~` on a percentage means the **window size is assumed, not known**. A
+session's own context window is recorded nowhere readable: above 200k tokens it must
+be the 1M window, but below that all cc4a has is this machine's configured model —
+correct for your own session, a guess for anyone else's. The token count is exact
+either way, and `--json` carries `context_window_source` as `inferred` or `assumed`.
 
 ### `cc4a status` — session, account and configuration facts
 

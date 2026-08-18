@@ -173,6 +173,32 @@ call waiting on state that only its own completion can change.
 Note also that a Claude Code foreground Bash call is capped at 600s, so any wait
 longer than ten minutes has to be backgrounded regardless of what it watches.
 
+## Reading a transcript without reading a transcript
+
+Transcripts grow large — 143MB was the biggest on the machine this was written on,
+with several over 40MB. Everything a monitor wants (the latest `usage` block) is in
+the *last* record, so scan backwards from EOF in chunks instead of parsing forward.
+That turns a multi-second read into ~1ms, and makes per-session context across every
+session on the host viable: 41 sessions in 0.2s.
+
+Two details matter. Discard the first line of each chunk unless you have reached the
+start of the file, since it is usually a partial line. And skip records with
+`isSidechain: true`, which belong to subagents rather than the session itself.
+
+## A session's context window size is not recorded
+
+The transcript gives exact token counts but never the window they are measured
+against. `message.model` reads `claude-opus-5`, with no marker distinguishing the
+200k variant from the 1M one; only the local `settings.json` carries `opus[1m]`, and
+that describes *your* session, not the one you are inspecting.
+
+So the percentage is only partly knowable from outside. Above 200k used tokens the
+window must be the larger one — the number could not fit otherwise. Below that it is
+genuinely ambiguous: 150k could be 75% of 200k or 15% of 1M. Report the token count,
+which is exact, and label the percentage as assumed when it rests on a guess. The
+statusline sidecar carries `context_window_size` explicitly and settles it, but only
+for a session that has one installed.
+
 ## Telling a busy session from an idle one
 
 `~/.claude/sessions/<pid>.json` carries a live `status` field, updated as the session
