@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -912,6 +912,11 @@ def cmd_stats(argv):
         print(STATS_HELP)
         return 0
     since, by, top = None, "session", 10
+    try:
+        check_args(argv, ("--json",), ("--since=", "--by=", "--top="))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     for a in argv:
         if a.startswith("--since="):
             since = a.split("=", 1)[1]
@@ -926,6 +931,27 @@ def cmd_stats(argv):
         return 2
     print(json.dumps(st, indent=2) if "--json" in argv else human_stats(st, top))
     return 0 if st["rows"] else 1
+
+
+def check_args(argv, flags=(), prefixes=(), hints=None):
+    """Reject anything we do not understand.
+
+    Silently ignoring an unknown option is the worst available behaviour here:
+    `--sesion=<id>` is accepted, ignored, and answers about the wrong session, with
+    nothing to suggest the answer is not the one that was asked for.
+    """
+    for a in argv:
+        if a in flags or any(a.startswith(p) for p in prefixes):
+            continue
+        msg = "unknown option %r" % a
+        for pat, hint in (hints or {}).items():
+            if a == pat or a.startswith(pat + "="):
+                msg += "\n" + hint
+                break
+        else:
+            if prefixes or flags:
+                msg += "\naccepts: %s" % ", ".join(sorted(set(flags) | set(prefixes)))
+        raise ValueError(msg)
 
 
 # ---------- sessions ----------
@@ -1032,9 +1058,14 @@ def cmd_sessions(argv):
         print(SESSIONS_HELP)
         return 0
     top = 20
-    for a in argv:
-        if a.startswith("--top="):
-            top = int(a.split("=", 1)[1])
+    try:
+        check_args(argv, ("--json", "--active"), ("--top=",))
+        for a in argv:
+            if a.startswith("--top="):
+                top = int(a.split("=", 1)[1])
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     rows = build_sessions(active_only="--active" in argv)
     if "--json" in argv:
         print(json.dumps({"sessions": rows}, indent=2))
@@ -1197,6 +1228,11 @@ def cmd_status(argv):
     if "--help" in argv or "-h" in argv:
         print(STATUS_HELP)
         return 0
+    try:
+        check_args(argv, ("--json", "--local"), ("--session=",))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     s = build_status(session_id(argv), local_only="--local" in argv)
     print(json.dumps(s, indent=2) if "--json" in argv else human_status(s))
     return 0 if s.get("session_id") else 1
@@ -1225,6 +1261,11 @@ def cmd_update(argv):
     if "--help" in argv or "-h" in argv:
         print(UPDATE_HELP)
         return 0
+    try:
+        check_args(argv, ("--check", "--force"), ("--ref=",))
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     ref = "main"
     for a in argv:
         if a.startswith("--ref="):
@@ -1286,6 +1327,13 @@ def cmd_context(argv):
     if "--help" in argv or "-h" in argv:
         print(CONTEXT_HELP)
         return 0
+    try:
+        check_args(argv, ("--json",), ("--session=",), {
+            "--all": "for every session's context at once, use `cc4a sessions`",
+            "--active": "for live sessions only, use `cc4a sessions --active`"})
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     sid = session_id(argv)
     if not sid:
         print("no session id (set CLAUDE_CODE_SESSION_ID or pass --session=)", file=sys.stderr)
@@ -1300,6 +1348,13 @@ def cmd_usage(argv):
     if "--help" in argv or "-h" in argv:
         print(USAGE_HELP)
         return 0
+    try:
+        check_args(argv, ("--json",), ("--session=",), {
+            "--window": "`cc4a usage` already reports every window; --window is only "
+                        "meaningful on `cc4a wait`"})
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     u = build_usage(session_id(argv))
     print(json.dumps(u, indent=2) if "--json" in argv else human_usage(u))
     return 0 if u["limits"] else 1
