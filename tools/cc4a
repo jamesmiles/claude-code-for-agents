@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -19,6 +19,7 @@ COMMANDS
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   stats       token totals per session on this host (local, mirrors /stats)
+  wait        block until a usage or context threshold is crossed
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 
@@ -86,12 +87,50 @@ Note that configuring any custom status line suppresses some built-in footer hin
 Not meant to be run by hand.
 """
 
+WAIT_HELP = """cc4a wait — block until a usage or context threshold is crossed.
+
+USAGE
+  cc4a wait [conditions] [--any|--all] [--timeout=<dur>] [--interval=<dur>] [--json]
+
+  Durations are <n>s / <n>m / <n>h / <n>d. Default timeout 1h; default poll 60s
+  when any usage condition is present (its data is cached for 60s), else 5s.
+
+CONDITIONS
+  --usage-above=N     5h window at or above N%   (--window=seven_day for weekly)
+  --usage-below=N     5h window at or below N%   (i.e. wait for a reset)
+  --context-above=N   another session's context at or above N%
+  --context-below=N   another session's context at or below N%
+
+  Context conditions require --session=<id>; see below. Give as many conditions as
+  you like. --any returns when the first is met (default), --all when every one is
+  met at the same poll. They are evaluated together in one loop, so this is how you
+  compose them — `cc4a wait --usage-above=90 --context-above=75 --any` does what
+  two concurrent waits would, without the shell juggling. `a && b` cannot: && runs
+  b only after a returns.
+
+EXIT CODES
+  0 condition met   1 data unavailable   2 bad invocation   3 timed out
+
+YOU CANNOT WAIT ON YOUR OWN CONTEXT
+  A session's context only grows when its turns complete. While you are blocked
+  inside this tool call your own turn has not completed, so your own context is
+  frozen for the entire wait and the threshold can never arrive. cc4a refuses that
+  combination rather than hanging until timeout. Waiting on *another* session's
+  context is fine — those advance independently.
+
+LONG WAITS MUST RUN IN THE BACKGROUND
+  A foreground Bash call in Claude Code is capped at 600s, so anything longer —
+  notably waiting out a 5-hour window — must be started with run_in_background.
+  The agent is re-invoked when the command exits, which is exactly the wakeup you
+  want. Default timeout is 1h; raise it with --timeout for a full-window wait.
+"""
+
 STATS_HELP = """cc4a stats — token totals for Claude sessions on this host.
 
 USAGE
   cc4a stats [--since=<dur>] [--by=<dim>] [--top=N] [--json]
 
-  --since=  window, as <n>m / <n>h / <n>d. Default 5h, the rate-limit window.
+  --since=  window, as <n>s / <n>m / <n>h / <n>d. Default 5h, the rate-limit window.
   --by=     session (default), project, model, or day
   --top=    rows to show, default 10. --json always returns every row.
 
@@ -367,18 +406,156 @@ def human_usage(u):
         for e in u["limits"])
 
 
+# ---------- wait ----------
+WINDOW_KIND = {"five_hour": "session", "seven_day": "weekly_all"}
+
+
+def usage_pct(window):
+    u = build_usage(None)
+    want = WINDOW_KIND.get(window)
+    for row in u["limits"]:
+        if row["kind"] == want:
+            return row["used_percentage"], u["source"]
+    return None, u["source"]
+
+
+def context_pct(sid):
+    c = build_context(sid)
+    return c.get("used_percentage"), c.get("source")
+
+
+def eval_condition(c):
+    """Return (met, current_value, detail)."""
+    if c["kind"] == "usage":
+        val, src = usage_pct(c["window"])
+    else:
+        val, src = context_pct(c["session"])
+    if val is None:
+        return None, None, src
+    met = val >= c["threshold"] if c["op"] == "above" else val <= c["threshold"]
+    return met, val, src
+
+
+def describe(c):
+    if c["kind"] == "usage":
+        return "usage[%s] %s %g%%" % (c["window"], c["op"], c["threshold"])
+    return "context[%s] %s %g%%" % (c["session"][:8], c["op"], c["threshold"])
+
+
+def cmd_wait(argv):
+    if "--help" in argv or "-h" in argv or not argv:
+        print(WAIT_HELP)
+        return 0 if argv else 2
+
+    conds, window, sid = [], "five_hour", None
+    mode, timeout_s, interval_s = "any", None, None
+    try:
+        for a in argv:
+            if a.startswith("--window="):
+                window = a.split("=", 1)[1]
+                if window not in WINDOW_KIND:
+                    raise ValueError("bad --window %r; use five_hour or seven_day" % window)
+            elif a.startswith("--session="):
+                sid = a.split("=", 1)[1]
+            elif a.startswith("--timeout="):
+                timeout_s = parse_duration(a.split("=", 1)[1])
+            elif a.startswith("--interval="):
+                interval_s = parse_duration(a.split("=", 1)[1], 0)
+            elif a == "--all":
+                mode = "all"
+            elif a == "--any":
+                mode = "any"
+            elif a.startswith("--usage-") or a.startswith("--context-"):
+                name, _, val = a[2:].partition("=")
+                kind, _, op = name.partition("-")
+                if op not in ("above", "below") or not val:
+                    raise ValueError("bad condition %r; use --%s-above=N or --%s-below=N"
+                                     % (a, kind, kind))
+                conds.append({"kind": kind, "op": op,
+                              "threshold": float(val.rstrip("%"))})
+            elif a != "--json":
+                raise ValueError("unknown option %r" % a)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    if not conds:
+        print("no conditions given; see `cc4a wait --help`", file=sys.stderr)
+        return 2
+
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for c in conds:
+        if c["kind"] == "usage":
+            c["window"] = window
+            continue
+        c["session"] = sid or me or ""
+        if not c["session"]:
+            print("--context-* needs --session=<id>", file=sys.stderr)
+            return 2
+        if c["session"] == me:
+            print("refusing to wait on this session's own context.\n"
+                  "Your context only advances when a turn completes, and your turn cannot\n"
+                  "complete while this call is blocking — the threshold could never arrive.\n"
+                  "Pass --session=<other-id> to watch a different session.", file=sys.stderr)
+            return 2
+
+    if timeout_s is None:
+        timeout_s = 3600
+    if interval_s is None:
+        interval_s = 60 if any(c["kind"] == "usage" for c in conds) else 5
+
+    started = time.time()
+    print("waiting for %s of: %s  (timeout %s, poll %s)"
+          % (mode, ", ".join(describe(c) for c in conds),
+             fmt_dur(timeout_s), fmt_dur(interval_s)), file=sys.stderr)
+
+    while True:
+        results = [eval_condition(c) for c in conds]
+        state = [{"condition": describe(c), "current": v, "met": bool(m), "source": src}
+                 for c, (m, v, src) in zip(conds, results)]
+        met_flags = [m for m, _, _ in results]
+        satisfied = (any(met_flags) if mode == "any" else
+                     (all(met_flags) and None not in met_flags))
+        elapsed = time.time() - started
+
+        if satisfied:
+            out = {"result": "met", "mode": mode, "waited_seconds": int(elapsed),
+                   "conditions": state}
+            print(json.dumps(out, indent=2) if "--json" in argv else
+                  "met after %s: %s" % (fmt_dur(int(elapsed)) if elapsed >= 60 else "%ds" % elapsed,
+                                        ", ".join("%s (now %.1f%%)" % (s["condition"], s["current"])
+                                                  for s in state if s["met"])))
+            return 0
+
+        if all(m is None for m in met_flags):
+            print("data unavailable for every condition (%s)"
+                  % ", ".join(sorted({s["source"] or "?" for s in state})), file=sys.stderr)
+            return 1
+
+        if elapsed + interval_s > timeout_s:
+            out = {"result": "timeout", "mode": mode, "waited_seconds": int(elapsed),
+                   "conditions": state}
+            print(json.dumps(out, indent=2) if "--json" in argv else
+                  "timed out after %s; %s" % (fmt_dur(timeout_s),
+                                              ", ".join("%s at %s%%" % (s["condition"], s["current"])
+                                                        for s in state)), file=sys.stderr)
+            return 3
+
+        time.sleep(interval_s)
+
+
 # ---------- stats ----------
 def parse_duration(text, default_seconds=5 * 3600):
     if not text:
         return default_seconds
-    units = {"m": 60, "h": 3600, "d": 86400}
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
     try:
         n, u = int(text[:-1]), text[-1].lower()
         if u in units and n > 0:
             return n * units[u]
     except ValueError:
         pass
-    raise ValueError("bad duration %r; use <n>m, <n>h or <n>d" % text)
+    raise ValueError("bad duration %r; use <n>s, <n>m, <n>h or <n>d" % text)
 
 
 def iter_usage(cutoff):
@@ -805,7 +982,7 @@ def cmd_statusline(argv):
     return 0
 
 
-COMMANDS = {"status": cmd_status, "stats": cmd_stats, "context": cmd_context, "usage": cmd_usage,
+COMMANDS = {"status": cmd_status, "stats": cmd_stats, "wait": cmd_wait, "context": cmd_context, "usage": cmd_usage,
             "statusline": cmd_statusline, "update": cmd_update}
 
 

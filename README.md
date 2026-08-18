@@ -51,6 +51,7 @@ COMMANDS
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   stats       token totals per session on this host (local, mirrors /stats)
+  wait        block until a usage or context threshold is crossed
   statusline  sidecar mode; see `cc4a statusline --help`
   update      install the latest version from the repo
 ```
@@ -161,6 +162,37 @@ consumed, so cc4a ranks by `output`, shows `cache-write` beside it, and prints
 **`SHARE` is share of the window, not of your quota.** Anthropic publishes no token
 denominator for the 5h or 7d limits (see `cc4a usage`), so "this session used X% of
 your limit" is not a computable number and cc4a does not imply one.
+
+### `cc4a wait` — block until a threshold is crossed
+
+```sh
+cc4a wait --usage-above=90                          # 5h window hits 90%
+cc4a wait --usage-below=5 --timeout=6h              # wait out a window reset
+cc4a wait --usage-above=90 --context-above=75 --session=<id> --any
+```
+
+Conditions are `--usage-above/below=N` (add `--window=seven_day` for the weekly cap)
+and `--context-above/below=N`. Exit `0` when met, `3` on timeout.
+
+**Composition is built in, because `&&` cannot do it.** `a && b` runs `b` only after
+`a` returns, so two waits chained that way are sequential, not concurrent. Instead
+pass every condition to one `wait`: they are evaluated together on each poll, with
+`--any` returning on the first met (default) and `--all` when they hold
+simultaneously.
+
+**You cannot wait on your own context, and cc4a refuses to pretend otherwise.** A
+session's context only advances when its turns complete, and your turn cannot
+complete while a tool call of yours is blocking — so your own context is frozen for
+the entire wait and the threshold can never arrive. Measured directly: sampling own
+context three times across 6s inside one call gives `191,346 → 192,020 → 192,020`,
+moving once as the current turn's own record lands and then never again. `wait`
+rejects that combination up front instead of hanging until timeout. Watching
+*another* session with `--session=<id>` works fine — those advance independently.
+
+**Long waits must run in the background.** A foreground Bash call in Claude Code is
+capped at 600s, so waiting out a 5-hour window has to be started with
+`run_in_background`; the agent is re-invoked when the command exits, which is the
+wakeup you wanted anyway. Default timeout is 1h.
 
 ### `cc4a update` — install the latest version
 

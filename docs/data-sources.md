@@ -152,6 +152,28 @@ Note also that `~/.claude/stats-cache.json` already holds `dailyModelTokens` and
 `lastComputedDate` typically lags a day behind. Per-session numbers require the scan.
 On subscription plans its `costUSD` fields are `0`, so cost is not a usable ranking.
 
+## A session cannot observe its own context advancing
+
+Context occupancy is only written when an assistant turn completes. While a tool
+call is executing, the calling session's turn has not completed, so its own context
+is frozen for the duration of that call. Sampling it three times over six seconds
+inside a single call gives:
+
+```
+t=0s  191,346 tokens
+t=3s  192,020 tokens   <- the current turn's own record lands
+t=6s  192,020 tokens   <- and nothing further, however long you wait
+```
+
+Any design where an agent blocks waiting for *its own* context to reach a threshold
+deadlocks by construction. Other sessions' contexts advance normally and can be
+polled from outside; rate limits also move on their own, through other sessions'
+activity and through window resets. Build waits on those, and reject the self-watch
+case explicitly rather than letting it hang.
+
+Note also that a Claude Code foreground Bash call is capped at 600s, so any wait
+longer than ten minutes has to be backgrounded regardless of what it watches.
+
 ## Session and account facts
 
 `~/.claude/sessions/<pid>.json` is written per running process and carries most of
