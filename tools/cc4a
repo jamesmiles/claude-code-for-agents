@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.12.1"
+VERSION = "0.13.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -614,7 +614,7 @@ def last_assistant_record(path, chunk=262144, max_bytes=8 * 1024 * 1024):
             # the first element may be a partial line unless we reached the start
             start = 0 if pos == 0 else 1
             for raw in reversed(lines[start:]):
-                if b'"type":"assistant"' not in raw:
+                if b'"assistant"' not in raw:      # cheap reject; parse decides
                     continue
                 try:
                     d = json.loads(raw.decode("utf-8", "replace"))
@@ -959,7 +959,7 @@ def iter_usage(cutoff):
         cwd = None
         with open(path, errors="replace") as fh:
             for line in fh:
-                if '"type":"assistant"' not in line:
+                if '"assistant"' not in line:      # cheap reject; parse decides
                     continue
                 try:
                     d = json.loads(line)

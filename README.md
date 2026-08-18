@@ -367,6 +367,27 @@ If you want a tray icon showing your weekly burn, use one of those — they're b
 at it. If you want Claude to check its own headroom before starting something
 expensive, use this.
 
+## Tests
+
+```sh
+python3 tests/run.py            # all of them
+python3 tests/run.py stampede   # just the ones whose name matches
+```
+
+Stdlib only, a few seconds to run. Every test corresponds to a defect that reached
+a user, so the suite is a list of the ways this tool has actually been wrong rather
+than a coverage exercise.
+
+It never touches your real state or Anthropic's endpoints. `HOME` is redirected at a
+temp directory, synthetic transcripts and session records provide the fixtures, and
+**both** OAuth endpoints are rewritten to a local stub — with an assertion that fails
+the run if either was missed, since a test that quietly reaches the live rate-limited
+endpoint is worse than no test.
+
+The suite is mutation-checked: reintroducing the blind-timeout bug, removing
+single-flight, un-caching failures, or restoring silent option handling each makes it
+fail. A suite that only ever passes proves nothing.
+
 ## Design rules
 
 Every tool in here is expected to hold to these, and `cc4a` is the reference
