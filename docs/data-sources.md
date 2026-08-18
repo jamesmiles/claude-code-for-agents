@@ -61,7 +61,7 @@ Caveats from the docs:
 
 Since the agent can't read the statusline's output, the trick is to have the
 statusline **write the payload to disk** keyed by `session_id`, and let the agent
-read that file. That's what `cc4a budget --statusline` does.
+read that file. That's what `cc4a statusline` does.
 
 ### Hook stdin
 
