@@ -6,15 +6,29 @@ Claude Code exposes a lot of its own state to the *user* — `/usage`, `/context
 status bar. Very little of it reaches the *agent*. These tools close that gap: they
 are meant to be run by Claude mid-task, not read by a human on a dashboard.
 
-Design rules for anything in here:
+## Install
 
-- **A script.** A shell command with machine-readable output — not a GUI, not a
-  daemon, not an MCP server.
-- **No standing footprint.** Nothing registers with Claude Code, nothing sits in the
-  system prompt. A tool costs zero context until the moment it is run.
-- **Cheap when it does run.** Output is compact; an agent pays context to read it.
-- **Honest about gaps.** Unknown is reported as unknown, never guessed.
-- **No dependencies.** Stdlib only, so it runs wherever Claude Code runs.
+```sh
+curl -fsSL https://raw.githubusercontent.com/jamesmiles/claude-code-for-agents/main/install.sh | bash
+```
+
+Copies `cc4a` into `~/.claude/tools/`; update later with `cc4a update`.
+
+If you would rather read the code before running it — a fair instinct for anything
+that touches your OAuth token — clone and install from there instead:
+
+```sh
+git clone https://github.com/jamesmiles/claude-code-for-agents
+cd claude-code-for-agents && ./install.sh
+```
+
+From a clone the installer symlinks rather than copies, so `git pull` updates in
+place. `./install.sh --copy` forces a copy. Or skip the installer entirely — these
+are standalone scripts, runnable from wherever you cloned them.
+
+Both paths honour `CC4A_DEST` (install directory) and `CC4A_REF` (branch or tag).
+The installer refuses to write anything that does not look like cc4a, so a 404 page
+or a truncated download cannot land as an executable.
 
 ## Tools
 
@@ -28,6 +42,7 @@ COMMANDS
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   statusline  sidecar mode; see `cc4a statusline --help`
+  update      install the latest version from the repo
 ```
 
 ### `cc4a context` — this session's context window
@@ -96,30 +111,6 @@ instead of the undocumented endpoint.
 
 Note that configuring any custom statusline suppresses some built-in footer hints.
 
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/jamesmiles/claude-code-for-agents/main/install.sh | bash
-```
-
-Copies `cc4a` into `~/.claude/tools/`; update later with `cc4a update`.
-
-If you would rather read the code before running it — a fair instinct for anything
-that touches your OAuth token — clone and install from there instead:
-
-```sh
-git clone https://github.com/jamesmiles/claude-code-for-agents
-cd claude-code-for-agents && ./install.sh
-```
-
-From a clone the installer symlinks rather than copies, so `git pull` updates in
-place. `./install.sh --copy` forces a copy. Or skip the installer entirely — these
-are standalone scripts, runnable from wherever you cloned them.
-
-Both paths honour `CC4A_DEST` (install directory) and `CC4A_REF` (branch or tag).
-The installer refuses to write anything that does not look like cc4a, so a 404 page
-or a truncated download cannot land as an executable.
-
 ## Making an agent aware of a tool
 
 A script the agent doesn't know about is a script the agent won't run. The cheapest
@@ -156,6 +147,19 @@ and statusline payload, so an account-wide dashboard structurally cannot report 
 If you want a tray icon showing your weekly burn, use one of those — they're better
 at it. If you want Claude to check its own headroom before starting something
 expensive, use this.
+
+## Design rules
+
+Every tool in here is expected to hold to these, and `cc4a` is the reference
+implementation of them:
+
+- **A script.** A shell command with machine-readable output — not a GUI, not a
+  daemon, not an MCP server.
+- **No standing footprint.** Nothing registers with Claude Code, nothing sits in the
+  system prompt. A tool costs zero context until the moment it is run.
+- **Cheap when it does run.** Output is compact; an agent pays context to read it.
+- **Honest about gaps.** Unknown is reported as unknown, never guessed.
+- **No dependencies.** Stdlib only, so it runs wherever Claude Code runs.
 
 ## Credentials and network
 
