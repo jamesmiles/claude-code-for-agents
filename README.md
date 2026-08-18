@@ -29,8 +29,11 @@ From a clone the installer symlinks rather than copies, so `git pull` updates in
 place. `./install.sh --copy` forces a copy. Or skip the installer entirely — these
 are standalone scripts, runnable from wherever you cloned them.
 
-Both paths honour `CC4A_DEST` (install directory), `CC4A_BIN` (the `PATH` directory
-to link into) and `CC4A_REF` (branch or tag).
+Both paths honour `CC4A_DEST` (install directory), `CC4A_BIN` (directory to link
+into, used verbatim whether or not it is on `PATH`) and `CC4A_REF` (branch or tag).
+Setting `CC4A_DEST` marks the install as isolated: it will not link into a shared
+`bin` directory unless you also set `CC4A_BIN`, so a sandboxed install cannot
+disturb a real one.
 
 The installer refuses to write anything that does not look like cc4a, so a 404 page
 or a truncated download cannot land as an executable. It also refuses to replace an

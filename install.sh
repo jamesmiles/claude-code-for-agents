@@ -14,6 +14,7 @@ set -euo pipefail
 REPO="jamesmiles/claude-code-for-agents"
 REF="${CC4A_REF:-main}"
 TOOLS=(cc4a)
+DEST_EXPLICIT=0; [ -n "${CC4A_DEST:-}" ] && DEST_EXPLICIT=1
 DEST="${CC4A_DEST:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}/tools}"
 RAW="https://raw.githubusercontent.com/$REPO/$REF"
 
@@ -93,9 +94,20 @@ done
 
 # Put it on PATH, or say exactly how to.
 linked=""
-if ! on_path "$DEST"; then
-  for bin in ${CC4A_BIN:-} "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
-    [ -n "$bin" ] || continue
+if [ -n "${CC4A_BIN:-}" ]; then
+  # An explicit CC4A_BIN is honoured as given, on PATH or not.
+  mkdir -p "$CC4A_BIN" || die "cannot create CC4A_BIN=$CC4A_BIN"
+  for tool in "${TOOLS[@]}"; do
+    ln -sf "$DEST/$tool" "$CC4A_BIN/$tool"
+    echo "  link  $CC4A_BIN/$tool"
+  done
+  linked="$CC4A_BIN"
+  on_path "$CC4A_BIN" || echo "  note: $CC4A_BIN is not on your PATH"
+elif [ "$DEST_EXPLICIT" -eq 1 ]; then
+  # An isolated install (CC4A_DEST set) must never touch a shared bin directory.
+  :
+elif ! on_path "$DEST"; then
+  for bin in "$HOME/.local/bin" "$HOME/bin" /usr/local/bin; do
     if [ -d "$bin" ] && [ -w "$bin" ] && on_path "$bin"; then
       for tool in "${TOOLS[@]}"; do
         ln -sf "$DEST/$tool" "$bin/$tool"
