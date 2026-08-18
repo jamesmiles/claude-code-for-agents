@@ -151,10 +151,16 @@ take the newest record rather than a sum.
 
 Two things make it practical and correct:
 
-**Prune by mtime first.** A file containing a message newer than T must itself have
-an mtime newer than T, so `os.stat` rejects most of the corpus before you parse a
-byte. A 5-hour window touched 21 of 116 files on this machine; a 30-day pass over
-1GB still finished in ~1.5s.
+**Prune by mtime first, but never report it.** A file containing a message newer
+than T must itself have an mtime newer than T, so `os.stat` rejects most of the
+corpus before you parse a byte — a 5-hour window touched 21 of 116 files here, and a
+30-day pass over 1GB finished in ~1.5s. That makes mtime a sound *filter* and a bad
+*answer*: Claude Code keeps appending to a transcript long after the conversation
+ends — `system` notices, `file-history-snapshot`, `ai-title`, `last-prompt` — so the
+file keeps being touched while nothing is said. Two transcripts on this machine had
+an mtime six days ahead of their newest message. For "when did this session last do
+something", read the newest `user`/`assistant` record's `timestamp` instead; the
+backwards tail scan already has it in hand.
 
 **Do not sum the four token counts.** They are not commensurable:
 

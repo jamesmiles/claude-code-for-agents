@@ -76,8 +76,21 @@ This is the discovery step the other commands need: it hands you the session ids
 that `cc4a wait --context-above=80@<id>` and `cc4a context --session=<id>` take.
 `--active` narrows to sessions whose turn is in flight or awaiting input.
 
-`LAST` is the age of the session's **transcript** — the truest "last did something"
-signal, since a session record's own `updatedAt` only moves on state transitions.
+`LAST` is the age of the session's newest **user or assistant message**, not its
+file mtime. Claude Code keeps appending system notices and file-history records long
+after a conversation ends, so mtime can run days ahead of anything anyone said — two
+transcripts here were six days out. The message timestamp comes free from the same
+backwards scan that reads the context.
+
+Together with `context_used_tokens` from `--json`, that is enough to reproduce
+Claude Code's own resume heuristic — it offers "resume from summary" when a session
+is at least 70 minutes idle **and** over 100k tokens
+(`CLAUDE_CODE_RESUME_THRESHOLD_MINUTES` / `CLAUDE_CODE_RESUME_TOKEN_THRESHOLD`):
+
+```sh
+cc4a sessions --json | jq '.sessions[]
+  | select(.context_used_tokens >= 100000 and .last_active_seconds_ago >= 4200)'
+```
 
 A status of `busy?` means the session claims to be busy but has not written its
 transcript in `--stale-after` (default 5m). Claude Code sets that flag when a turn

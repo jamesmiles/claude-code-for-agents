@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -242,9 +242,10 @@ COLUMNS
                     and does not reliably clear it, so a crashed or abandoned turn
                     keeps asserting work that stopped long ago. --active excludes
                     these; --json carries status_stale alongside the raw status.
-  LAST      how long since the session's transcript was last written — the truest
-            "last did something" signal, since the record's own updatedAt only
-            moves on state transitions.
+  LAST      how long since the session's newest user or assistant message. Not the
+            transcript's mtime: Claude Code keeps appending system notices and
+            file-history records long after a conversation ends, so mtime can run
+            days ahead of anything anyone actually said.
   CONTEXT   that session's context window usage, read from the tail of its
             transcript. Cheap even for a 100MB+ log.
             A leading ~ means the window size is assumed, not known: a session's
@@ -638,16 +639,22 @@ def window_size_guess():
     return 200_000
 
 
-def last_assistant_record(path, chunk=262144, max_bytes=8 * 1024 * 1024):
-    """Last non-sidechain assistant record, read backwards from EOF.
+def tail_scan(path, chunk=262144, max_bytes=8 * 1024 * 1024):
+    """(last non-sidechain assistant record, newest user/assistant timestamp).
 
-    Transcripts reach tens of megabytes; the record we want is almost always in
-    the final few KB, so scanning the whole file to find it is pure waste.
+    Transcripts reach hundreds of megabytes; both answers live in the final few KB,
+    so scanning forward to find them is pure waste. One backwards pass gets both.
+
+    The timestamp is not the file's mtime. Claude Code appends records long after
+    the conversation stops — system notices, file-history snapshots, titles — so
+    mtime can run days ahead of the last thing anyone said. Measured on this
+    machine: two transcripts whose mtime led their newest message by six days.
     """
     try:
         size = os.path.getsize(path)
     except OSError:
-        return None
+        return None, None
+    record, newest_ts = None, None
     with open(path, "rb") as fh:
         tail, pos = b"", size
         while pos > 0 and size - pos < max_bytes:
@@ -659,15 +666,25 @@ def last_assistant_record(path, chunk=262144, max_bytes=8 * 1024 * 1024):
             # the first element may be a partial line unless we reached the start
             start = 0 if pos == 0 else 1
             for raw in reversed(lines[start:]):
-                if b'"assistant"' not in raw:      # cheap reject; parse decides
-                    continue
+                if b'"assistant"' not in raw and b'"user"' not in raw:
+                    continue                       # cheap reject; parse decides
                 try:
                     d = json.loads(raw.decode("utf-8", "replace"))
                 except Exception:
                     continue
-                if d.get("type") == "assistant" and not d.get("isSidechain"):
-                    return d
-    return None
+                if d.get("type") not in ("user", "assistant") or d.get("isSidechain"):
+                    continue
+                if newest_ts is None and d.get("timestamp"):
+                    newest_ts = d["timestamp"]     # scanning backwards: first is newest
+                if record is None and d.get("type") == "assistant":
+                    record = d
+                if record is not None and newest_ts is not None:
+                    return record, newest_ts
+    return record, newest_ts
+
+
+def last_assistant_record(path, **kw):
+    return tail_scan(path, **kw)[0]
 
 
 def build_context(sid):
@@ -1223,7 +1240,15 @@ def build_sessions(active_only=False, stale_after=STALE_BUSY_SECONDS):
         if not sid:
             continue
         path = find_transcript(sid)
-        last = os.path.getmtime(path) if path and os.path.exists(path) else None
+        # Last *conversation* activity, not last file write: see tail_scan.
+        last = None
+        if path and os.path.exists(path):
+            _, ts = tail_scan(path)
+            try:
+                last = (datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        .timestamp()) if ts else os.path.getmtime(path)
+            except Exception:
+                last = os.path.getmtime(path)
         ctx = build_context(sid) if path else {}
         rows.append({
             "session_id": sid,

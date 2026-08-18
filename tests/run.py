@@ -107,14 +107,16 @@ class Env:
         open(self.tool, "w").write(src)
         os.chmod(self.tool, 0o755)
 
-    def transcript(self, sid=SID, tokens=100_000, model="claude-opus-5", extra_lines=0):
+    def transcript(self, sid=SID, tokens=100_000, model="claude-opus-5", extra_lines=0,
+                   age_seconds=0):
         path = os.path.join(self.dir, ".claude", "projects", "-fake", sid + ".jsonl")
         with open(path, "w") as f:
             for i in range(extra_lines):
                 f.write(compact({"type": "user", "n": i}) + "\n")
             f.write(compact({
                 "type": "assistant", "sessionId": sid, "cwd": "/fake",
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                           time.gmtime(time.time() - age_seconds)),
                 "message": {"model": model, "usage": {
                     "input_tokens": 0, "cache_read_input_tokens": tokens,
                     "cache_creation_input_tokens": 0, "output_tokens": 10}}}) + "\n")
@@ -326,11 +328,8 @@ def t_window_inference(e):
 @test("a stale busy flag is not reported as active")
 def t_stale_busy(e):
     ns = e.module()
-    e.transcript()
+    e.transcript(age_seconds=3600)                    # last message an hour ago
     e.session_record(status="busy")
-    old = time.time() - 3600
-    os.utime(os.path.join(e.dir, ".claude", "projects", "-fake", SID + ".jsonl"),
-             (old, old))
     ns["live_pids"] = lambda pids: set(pids)          # pretend the process is alive
     rows = ns["build_sessions"]()
     assert rows and rows[0]["status"] == "busy", rows
@@ -399,6 +398,22 @@ def t_blind_does_not_abort(e):
     elapsed = time.time() - start
     assert elapsed >= 5, "gave up after %.1fs; readable conditions were still live" % elapsed
     assert rc == 5, rc
+
+
+@test("LAST reflects the newest message, not later non-message writes")
+def t_last_active_ignores_file_writes(e):
+    ns = e.module()
+    path = e.transcript(age_seconds=6 * 86400)  # last message six days ago
+    # ...then the records Claude Code keeps appending long afterwards, which move
+    # the file's mtime to now without anything being said
+    with open(path, "a") as f:
+        f.write(compact({"type": "system", "note": "written later"}) + "\n")
+        f.write(compact({"type": "file-history-snapshot"}) + "\n")
+    e.session_record(status="idle")
+    ns["live_pids"] = lambda pids: set(pids)
+    row = ns["build_sessions"]()[0]
+    days = row["last_active_seconds_ago"] / 86400
+    assert 5.5 < days < 6.5, "reported %.2f days idle; mtime would have said ~0" % days
 
 
 @test("stats counts a repeated message.id once")
