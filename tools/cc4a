@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """cc4a — claude-code-for-agents: tools an agent can run to inspect its own session."""
-import json, os, subprocess, sys, time, glob, datetime, urllib.request, urllib.error
+import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
+import urllib.request, urllib.error
+
+VERSION = "0.1.0"
+REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
 
@@ -14,6 +18,7 @@ COMMANDS
   context     this session's context window        (local, always available)
   usage       account rate limits                  (network, may be unavailable)
   statusline  sidecar mode; see `cc4a statusline --help`
+  update      install the latest version from the repo
 
 Each command takes --json and --help. For both reports at once, run them together:
 `cc4a usage; cc4a context`.
@@ -77,6 +82,21 @@ Add to ~/.claude/settings.json:
 
 Note that configuring any custom status line suppresses some built-in footer hints.
 Not meant to be run by hand.
+"""
+
+UPDATE_HELP = """cc4a update — install the latest version from the repo.
+
+USAGE
+  cc4a update [--check] [--ref=<branch-or-tag>] [--force]
+
+  --check   report whether an update is available; change nothing
+  --ref=    install from a branch or tag other than main
+  --force   reinstall even if already current, or when running from a git clone
+
+Downloads over HTTPS from github.com/""" + REPO + """, verifies the payload looks
+like cc4a, and atomically replaces this file. If cc4a is running from a git clone,
+update refuses and points you at `git pull` instead, so it does not fight your
+working tree.
 """
 
 HOME = os.path.expanduser("~")
@@ -291,6 +311,77 @@ def human_usage(u):
         for e in u["limits"])
 
 
+# ---------- update ----------
+def in_git_clone(path):
+    d = os.path.dirname(path)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def remote_version(text):
+    for line in text.splitlines()[:40]:
+        if line.startswith("VERSION = "):
+            return line.split('"')[1]
+    return None
+
+
+def cmd_update(argv):
+    if "--help" in argv or "-h" in argv:
+        print(UPDATE_HELP)
+        return 0
+    ref = "main"
+    for a in argv:
+        if a.startswith("--ref="):
+            ref = a.split("=", 1)[1]
+    force = "--force" in argv
+    me = os.path.realpath(__file__)
+
+    clone = in_git_clone(me)
+    if clone and not force:
+        print("cc4a is running from a git clone at %s\n"
+              "update with `git -C %s pull`, or pass --force to overwrite the file."
+              % (clone, clone), file=sys.stderr)
+        return 1
+
+    url = "https://raw.githubusercontent.com/%s/%s/tools/cc4a" % (REPO, ref)
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            text = r.read().decode()
+    except Exception as e:
+        print("could not download from %s (%s)" % (url, type(e).__name__), file=sys.stderr)
+        return 1
+    if not text.startswith("#!") or "claude-code-for-agents" not in text:
+        print("downloaded payload does not look like cc4a; refusing to install "
+              "(bad ref %r?)" % ref, file=sys.stderr)
+        return 1
+
+    new = remote_version(text) or "?"
+    if new == VERSION and not force:
+        print("already up to date (%s)" % VERSION)
+        return 0
+    if "--check" in argv:
+        print("update available: %s -> %s" % (VERSION, new))
+        return 0
+
+    d = os.path.dirname(me)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".cc4a-")
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, os.stat(me).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        os.replace(tmp, me)
+    except OSError as e:
+        print("could not write %s (%s)" % (me, e.strerror), file=sys.stderr)
+        return 1
+    print("updated %s -> %s  (%s)" % (VERSION, new, me))
+    return 0
+
+
 # ---------- commands ----------
 def session_id(argv):
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
@@ -350,13 +441,17 @@ def cmd_statusline(argv):
     return 0
 
 
-COMMANDS = {"context": cmd_context, "usage": cmd_usage, "statusline": cmd_statusline}
+COMMANDS = {"context": cmd_context, "usage": cmd_usage,
+            "statusline": cmd_statusline, "update": cmd_update}
 
 
 def main():
     argv = sys.argv[1:]
     if not argv or argv[0] in ("--help", "-h", "help"):
         print(ROOT_HELP)
+        return 0
+    if argv[0] in ("--version", "-V", "version"):
+        print("cc4a %s" % VERSION)
         return 0
     if argv[0] not in COMMANDS:
         print("unknown command: %s\n" % argv[0], file=sys.stderr)

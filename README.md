@@ -68,6 +68,18 @@ an agent — so a model that runs one cold can interpret the result without any 
 that guidance sitting in its context beforehand. Exit codes are `0` data reported,
 `1` data unavailable, `2` bad invocation.
 
+### `cc4a update` — install the latest version
+
+```sh
+cc4a update            # replace this file with the latest from the repo
+cc4a update --check    # report whether an update is available, change nothing
+cc4a update --ref=v2   # install from a branch or tag
+```
+
+Verifies the download looks like cc4a before atomically replacing itself. If cc4a
+is running from a git clone it refuses and points at `git pull` instead, rather
+than overwriting a file git is tracking; `--force` overrides.
+
 ### `cc4a statusline` — optional, for exact live numbers
 
 The transcript lags by one turn. Claude Code's statusline receives an exact live
@@ -87,13 +99,26 @@ Note that configuring any custom statusline suppresses some built-in footer hint
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/jamesmiles/claude-code-for-agents/main/install.sh | bash
+```
+
+Copies `cc4a` into `~/.claude/tools/`; update later with `cc4a update`.
+
+If you would rather read the code before running it — a fair instinct for anything
+that touches your OAuth token — clone and install from there instead:
+
+```sh
 git clone https://github.com/jamesmiles/claude-code-for-agents
 cd claude-code-for-agents && ./install.sh
 ```
 
-Symlinks `tools/` into `~/.claude/tools/`, so `git pull` picks up updates.
-`./install.sh --copy` copies instead. Or skip the installer entirely — these are
-standalone scripts, runnable from wherever you cloned them.
+From a clone the installer symlinks rather than copies, so `git pull` updates in
+place. `./install.sh --copy` forces a copy. Or skip the installer entirely — these
+are standalone scripts, runnable from wherever you cloned them.
+
+Both paths honour `CC4A_DEST` (install directory) and `CC4A_REF` (branch or tag).
+The installer refuses to write anything that does not look like cc4a, so a 404 page
+or a truncated download cannot land as an executable.
 
 ## Making an agent aware of a tool
 
