@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -163,9 +163,16 @@ EXIT CODES
      does not distinguish them. The message does: "timed out after 6s" vs
      "met after 0s". For a gate, 3 is the normal negative branch, not an error.
   4  stalled: watching your own state from a call that blocks it (see below)
-  5  inconclusive: a condition's data went unavailable for --unavailable-timeout
-     (default 10m) and its threshold may have been crossed unobserved. NOT the
-     same as "not met" — an unreadable value is not a false one.
+  5  inconclusive: a condition could not be read, so its threshold may have been
+     crossed unobserved. NOT the same as "not met" — an unreadable value is not a
+     false one. Returned in two situations: a condition stayed unavailable for
+     --unavailable-timeout (default 10m), or the wait reached --timeout while any
+     condition was unreadable. The second matters most: giving up is only honestly
+     "did not fire" if everything was visible at the end.
+
+     With --json, `conditions[].met` is null and `available` is false for anything
+     unreadable, and `result` is "inconclusive". Machine consumers should branch on
+     those rather than on the value alone.
 
 PIPELINES EAT EXIT CODES
   `cc4a wait ... | head` reports head's status, not wait's, so a gate that did not
@@ -178,6 +185,8 @@ PIPELINES EAT EXIT CODES
 
   cc4a does not warn about this itself: the reason to pipe is usually --json, and
   writing a warning into that stream would corrupt the thing you were parsing.
+  --json output always goes to stdout, on every outcome, so it stays pipeable;
+  human-readable negative outcomes go to stderr.
 
 WATCHING YOUR OWN CONTEXT
   A session's context only advances when a turn completes. If this call is blocking
@@ -593,6 +602,15 @@ def describe(c):
     return "context[%s] %s %g%%" % (c["session"][:8], c["op"], c["threshold"])
 
 
+def emit_wait(out, human, as_json, ok):
+    """--json is a machine contract: it goes to stdout on every outcome, or a
+    consumer piping it gets nothing on exactly the paths worth inspecting."""
+    if as_json:
+        print(json.dumps(out, indent=2))
+    else:
+        print(human, file=sys.stdout if ok else sys.stderr)
+
+
 def cmd_wait(argv):
     if "--help" in argv or "-h" in argv or not argv:
         print(WAIT_HELP)
@@ -673,8 +691,10 @@ def cmd_wait(argv):
 
     while True:
         results = [eval_condition(c) for c in conds]
-        state = [{"condition": describe(c), "current": v, "met": bool(m), "source": src}
+        state = [{"condition": describe(c), "current": v, "met": m,
+                  "available": m is not None, "source": src}
                  for c, (m, v, src) in zip(conds, results)]
+        blind = [describe(c) for c, (m, _, _) in zip(conds, results) if m is None]
         # A condition we cannot evaluate is NOT a condition that is false. Treating
         # "the endpoint is down" as "the limit was never crossed" would make a
         # watchdog silently sleep through the outage it exists to catch.
@@ -696,13 +716,13 @@ def cmd_wait(argv):
         for i, since in list(unavailable_since.items()):
             dark = time.time() - since
             if dark >= unavail_s:
-                out = {"result": "inconclusive", "mode": mode,
-                       "waited_seconds": int(time.time() - started),
-                       "unavailable": describe(conds[i]), "conditions": state}
-                print(json.dumps(out, indent=2) if "--json" in argv else
-                      "inconclusive: %s has been unavailable for %s. Its threshold may "
-                      "have been crossed unobserved." % (describe(conds[i]), fmt_dur(int(dark))),
-                      file=sys.stderr)
+                emit_wait({"result": "inconclusive", "mode": mode,
+                           "waited_seconds": int(time.time() - started),
+                           "unavailable": [describe(conds[i])], "conditions": state},
+                          "inconclusive: %s has been unavailable for %s. Its threshold "
+                          "may have been crossed unobserved."
+                          % (describe(conds[i]), fmt_dur(int(dark))),
+                          "--json" in argv, False)
                 return 5
 
         met_flags = [m for m, _, _ in results]
@@ -711,12 +731,13 @@ def cmd_wait(argv):
         elapsed = time.time() - started
 
         if satisfied:
-            out = {"result": "met", "mode": mode, "waited_seconds": int(elapsed),
-                   "conditions": state}
-            print(json.dumps(out, indent=2) if "--json" in argv else
-                  "met after %s: %s" % (fmt_dur(int(elapsed)) if elapsed >= 60 else "%ds" % elapsed,
-                                        ", ".join("%s (now %.1f%%)" % (s["condition"], s["current"])
-                                                  for s in state if s["met"])))
+            emit_wait({"result": "met", "mode": mode, "waited_seconds": int(elapsed),
+                       "conditions": state},
+                      "met after %s: %s" % (
+                          fmt_dur(int(elapsed)) if elapsed >= 60 else "%ds" % int(elapsed),
+                          ", ".join("%s (now %.1f%%)" % (s["condition"], s["current"])
+                                    for s in state if s["met"])),
+                      "--json" in argv, True)
             return 0
 
         if watching_self:
@@ -734,16 +755,28 @@ def cmd_wait(argv):
             else:
                 last_own, stalled_since = own, time.time()
 
-        if elapsed + interval_s > timeout_s:
-            out = {"result": "timeout", "mode": mode, "waited_seconds": int(elapsed),
-                   "conditions": state}
-            print(json.dumps(out, indent=2) if "--json" in argv else
-                  "timed out after %s; %s" % (fmt_dur(timeout_s),
-                                              ", ".join("%s at %s%%" % (s["condition"], s["current"])
-                                                        for s in state)), file=sys.stderr)
+        remaining = timeout_s - elapsed
+        if remaining <= 0:
+            # About to report "did not fire". That claim is only honest if every
+            # condition was actually readable at this moment; otherwise the answer
+            # is "I could not see", which is a different thing and a different code.
+            if blind:
+                emit_wait({"result": "inconclusive", "mode": mode,
+                           "waited_seconds": int(elapsed), "unavailable": blind,
+                           "conditions": state},
+                          "inconclusive after %ds: %s could not be read, so its "
+                          "threshold may have been crossed unobserved."
+                          % (int(elapsed), ", ".join(blind)), "--json" in argv, False)
+                return 5
+            emit_wait({"result": "timeout", "mode": mode, "waited_seconds": int(elapsed),
+                       "conditions": state},
+                      "timed out after %s; %s" % (
+                          fmt_dur(timeout_s),
+                          ", ".join("%s at %s%%" % (s["condition"], s["current"])
+                                    for s in state)), "--json" in argv, False)
             return 3
 
-        time.sleep(interval_s)
+        time.sleep(min(interval_s, remaining))
 
 
 # ---------- stats ----------

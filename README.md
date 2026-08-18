@@ -221,8 +221,11 @@ endpoint, so a watchdog has to distinguish "the limit was never crossed" from "I
 could not see the limit". `wait` never counts unavailable as below-threshold: a
 failure that cannot recover (no credentials, 401/403) exits `1` immediately rather
 than waiting, and a transient one warns on the first poll, keeps trying, then exits
-`5` **inconclusive** after `--unavailable-timeout` (default 10m) saying the threshold
-may have been crossed unobserved. This matters most in the mixed shape
+`5` **inconclusive** — either after `--unavailable-timeout` (default 10m), or the
+moment the wait reaches `--timeout` with any condition still unreadable, since
+giving up is only honestly "did not fire" if everything was visible at the end.
+With `--json`, `conditions[].met` is `null` and `available` is `false`; branch on
+those. `--json` goes to stdout on every outcome so it stays pipeable. This matters most in the mixed shape
 `--usage-above=85 --context-above=75 --any`, where a dead endpoint would otherwise be
 masked by a healthy condition and the wait would sleep straight through the outage.
 
