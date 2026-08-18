@@ -68,13 +68,19 @@ for tool in "${TOOLS[@]}"; do
   if [ -L "$target" ]; then
     current="$(readlink "$target")"
     if [ "$current" != "$staged" ] && [ "$FORCE" -eq 0 ]; then
+      repo="$(cd -- "$(dirname -- "$current")/.." 2>/dev/null && pwd)" || repo=""
       echo >&2
       echo "refusing to replace a symlink:" >&2
       echo "  $target" >&2
       echo "  -> $current" >&2
       echo >&2
-      echo "That is probably a clone you develop in. Update it with \`git -C \"\$(dirname \"\$(dirname \"$current\")\")\" pull\`," >&2
-      echo "or re-run this installer with --force to replace it with a standalone copy." >&2
+      echo "That is probably a clone you develop in; replacing it with a copy would" >&2
+      echo "silently detach your edits from what actually runs." >&2
+      echo >&2
+      if [ -n "$repo" ] && [ -d "$repo/.git" ]; then
+        echo "To update that clone:      git -C $repo pull" >&2
+      fi
+      echo "To replace it anyway:      re-run with --force" >&2
       exit 1
     fi
   fi
