@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -111,12 +111,15 @@ CONDITIONS
 EXIT CODES
   0 condition met   1 data unavailable   2 bad invocation   3 timed out
 
-YOU CANNOT WAIT ON YOUR OWN CONTEXT
-  A session's context only grows when its turns complete. While you are blocked
-  inside this tool call your own turn has not completed, so your own context is
-  frozen for the entire wait and the threshold can never arrive. cc4a refuses that
-  combination rather than hanging until timeout. Waiting on *another* session's
-  context is fine — those advance independently.
+WATCHING YOUR OWN CONTEXT
+  A session's context only advances when a turn completes. If this call is blocking
+  your own turn, the turn cannot complete, your context is frozen, and the threshold
+  never arrives. Run it with run_in_background and it works normally.
+
+  cc4a does not guess how it was invoked: it watches for own-context that has not
+  moved while the session still reports status "busy", and exits 4 with an
+  explanation after --stall-timeout (default 5m) instead of hanging. Watching
+  another session with --session=<id> has no such constraint.
 
 LONG WAITS MUST RUN IN THE BACKGROUND
   A foreground Bash call in Claude Code is capped at 600s, so anything longer —
@@ -407,6 +410,13 @@ def human_usage(u):
 
 
 # ---------- wait ----------
+def session_status(sid):
+    """busy | waiting | idle | None — how Claude Code reports the session's turn."""
+    rec = session_record(sid)
+    return rec.get("status") if rec.get("sessionId") == sid else None
+
+
+
 WINDOW_KIND = {"five_hour": "session", "seven_day": "weekly_all"}
 
 
@@ -448,7 +458,7 @@ def cmd_wait(argv):
         return 0 if argv else 2
 
     conds, window, sid = [], "five_hour", None
-    mode, timeout_s, interval_s = "any", None, None
+    mode, timeout_s, interval_s, stall_s = "any", None, None, 300
     try:
         for a in argv:
             if a.startswith("--window="):
@@ -461,6 +471,8 @@ def cmd_wait(argv):
                 timeout_s = parse_duration(a.split("=", 1)[1])
             elif a.startswith("--interval="):
                 interval_s = parse_duration(a.split("=", 1)[1], 0)
+            elif a.startswith("--stall-timeout="):
+                stall_s = parse_duration(a.split("=", 1)[1], 0)
             elif a == "--all":
                 mode = "all"
             elif a == "--any":
@@ -484,6 +496,7 @@ def cmd_wait(argv):
         return 2
 
     me = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    watching_self = False
     for c in conds:
         if c["kind"] == "usage":
             c["window"] = window
@@ -493,17 +506,20 @@ def cmd_wait(argv):
             print("--context-* needs --session=<id>", file=sys.stderr)
             return 2
         if c["session"] == me:
-            print("refusing to wait on this session's own context.\n"
-                  "Your context only advances when a turn completes, and your turn cannot\n"
-                  "complete while this call is blocking — the threshold could never arrive.\n"
-                  "Pass --session=<other-id> to watch a different session.", file=sys.stderr)
-            return 2
+            watching_self = True
 
     if timeout_s is None:
         timeout_s = 3600
     if interval_s is None:
         interval_s = 60 if any(c["kind"] == "usage" for c in conds) else 5
 
+    if watching_self:
+        print("note: watching this session's own context. That only advances when a turn\n"
+              "completes, so this must NOT be blocking your turn — start it with\n"
+              "run_in_background. If it is blocking, the value is frozen and this exits 4\n"
+              "after %s rather than hanging." % fmt_dur(stall_s), file=sys.stderr)
+
+    last_own, stalled_since = None, time.time()
     started = time.time()
     print("waiting for %s of: %s  (timeout %s, poll %s)"
           % (mode, ", ".join(describe(c) for c in conds),
@@ -526,6 +542,21 @@ def cmd_wait(argv):
                                         ", ".join("%s (now %.1f%%)" % (s["condition"], s["current"])
                                                   for s in state if s["met"])))
             return 0
+
+        if watching_self:
+            own = [s2["current"] for s2, c in zip(state, conds)
+                   if c["kind"] == "context" and c.get("session") == me]
+            if own and own == last_own:
+                stalled_for = time.time() - stalled_since
+                if stalled_for >= stall_s and session_status(me) == "busy":
+                    print("own context frozen at %s%% for %s while this session is still busy.\n"
+                          "This call is blocking your own turn, so the turn cannot complete and\n"
+                          "your context cannot advance — the threshold will never arrive.\n"
+                          "Re-run with run_in_background, or watch another session."
+                          % (own[0], fmt_dur(int(stalled_for))), file=sys.stderr)
+                    return 4
+            else:
+                last_own, stalled_since = own, time.time()
 
         if all(m is None for m in met_flags):
             print("data unavailable for every condition (%s)"

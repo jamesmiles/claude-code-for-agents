@@ -152,9 +152,9 @@ Note also that `~/.claude/stats-cache.json` already holds `dailyModelTokens` and
 `lastComputedDate` typically lags a day behind. Per-session numbers require the scan.
 On subscription plans its `costUSD` fields are `0`, so cost is not a usable ranking.
 
-## A session cannot observe its own context advancing
+## A blocking call freezes the caller's own context
 
-Context occupancy is only written when an assistant turn completes. While a tool
+Context occupancy is written only when an assistant turn *completes*. While a tool
 call is executing, the calling session's turn has not completed, so its own context
 is frozen for the duration of that call. Sampling it three times over six seconds
 inside a single call gives:
@@ -165,14 +165,30 @@ t=3s  192,020 tokens   <- the current turn's own record lands
 t=6s  192,020 tokens   <- and nothing further, however long you wait
 ```
 
-Any design where an agent blocks waiting for *its own* context to reach a threshold
-deadlocks by construction. Other sessions' contexts advance normally and can be
-polled from outside; rate limits also move on their own, through other sessions'
-activity and through window resets. Build waits on those, and reject the self-watch
-case explicitly rather than letting it hang.
+This constrains *blocking* designs only. An agent that starts a long-running process
+in the background lets its turn complete normally, so its context does advance and a
+background watcher observes it fine. The failure mode is specifically a foreground
+call waiting on state that only its own completion can change.
 
 Note also that a Claude Code foreground Bash call is capped at 600s, so any wait
 longer than ten minutes has to be backgrounded regardless of what it watches.
+
+## Telling a busy session from an idle one
+
+`~/.claude/sessions/<pid>.json` carries a live `status` field, updated as the session
+runs:
+
+```
+  pid=62460   status=busy     updated=   33s ago  331f014e  external-source-c4
+  pid=44046   status=waiting  updated=  112s ago  e35bfb83  worktree-clear-cloud-fa8a-10
+  pid=38642   status=idle     updated= 2442s ago  e2f2f822  worktree-green-harbor-a623-c4
+```
+
+`busy` means a turn is in flight, `waiting` means it is waiting on the user, `idle`
+means neither. Combined with the section above this is enough to distinguish "the
+value I am watching has not moved yet" from "the value I am watching cannot move,
+because I am the one blocking it": unchanged own-context plus `status: busy` means
+the watcher is inside the very turn whose completion it is waiting for.
 
 ## Session and account facts
 

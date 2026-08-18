@@ -180,19 +180,25 @@ pass every condition to one `wait`: they are evaluated together on each poll, wi
 `--any` returning on the first met (default) and `--all` when they hold
 simultaneously.
 
-**You cannot wait on your own context, and cc4a refuses to pretend otherwise.** A
-session's context only advances when its turns complete, and your turn cannot
-complete while a tool call of yours is blocking — so your own context is frozen for
-the entire wait and the threshold can never arrive. Measured directly: sampling own
-context three times across 6s inside one call gives `191,346 → 192,020 → 192,020`,
-moving once as the current turn's own record lands and then never again. `wait`
-rejects that combination up front instead of hanging until timeout. Watching
-*another* session with `--session=<id>` works fine — those advance independently.
+**Watching your own context requires backgrounding.** A session's context only
+advances when a turn *completes*. If `wait` is blocking your own turn, your turn
+cannot complete, so your own context is frozen and the threshold never arrives —
+measured directly, sampling own context across 6s inside one blocking call gives
+`191,346 → 192,020 → 192,020`: it moves once as the current turn's own record lands,
+then never again.
 
-**Long waits must run in the background.** A foreground Bash call in Claude Code is
-capped at 600s, so waiting out a 5-hour window has to be started with
-`run_in_background`; the agent is re-invoked when the command exits, which is the
-wakeup you wanted anyway. Default timeout is 1h.
+Started with `run_in_background`, the turn completes normally, context advances, and
+the wait works as you would expect. So cc4a allows it and detects the bad case
+instead of guessing: if own context is unchanged while `~/.claude/sessions/<pid>.json`
+still reports `status: busy`, it exits `4` with an explanation after
+`--stall-timeout` (default 5m) rather than hanging for the full timeout.
+
+Watching *another* session with `--session=<id>` has no such constraint.
+
+**Long waits must run in the background anyway.** A foreground Bash call in Claude
+Code is capped at 600s, so waiting out a 5-hour window has to be backgrounded
+regardless; the agent is re-invoked when the command exits, which is the wakeup you
+wanted. Default timeout is 1h.
 
 ### `cc4a update` — install the latest version
 
