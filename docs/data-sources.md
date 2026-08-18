@@ -101,6 +101,14 @@ anthropic-beta: oauth-2025-04-20
 request for official programmatic access. Treat a failure as "unknown", never as
 "fine".
 
+**A TTL cache alone will not protect it.** A cache with a 60s TTL does not serialise
+concurrent misses: when it expires, every process waiting on it goes to the network
+at the same moment. Measured with twelve concurrent callers on one machine: twelve
+outbound requests, each caller correctly believing it had respected the TTL. On a
+machine running many agent sessions that is enough to reach a rate limit through
+nothing but ordinary polling. Take a lock around the fetch and let the losers serve
+stale data — a percentage that is 90s old is worth far more than a 429.
+
 **It is rate limited, so cache failures, not just successes.** A cache that holds
 only successful reads turns a rate limit into a feedback loop: the 429 is not
 cached, the next poll re-fires immediately, and that earns another 429. Measured on

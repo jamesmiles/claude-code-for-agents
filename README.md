@@ -155,15 +155,24 @@ Read from Anthropic's OAuth usage endpoint, cached 60s. Unlike `context` this on
 is a network call against an **undocumented** endpoint, so it can fail; it exits 1
 and says so rather than reporting a healthy-looking guess.
 
-**The endpoint is rate limited, and failures are cached too.** Caching only
-successful reads makes a rate limit self-sustaining: the 429 is not cached, so the
-next poll re-fires immediately, which earns another 429. A watcher polling every 2s
-sent 11 requests for 10 polls. Failures now back off — `Retry-After` when the
-response carries it, otherwise 10s doubling to 5m — and the state lives in a file,
-so separate `cc4a` invocations share it rather than each starting fresh. The same
-10-poll run now sends 3 requests, and while a backoff is in force the reported
-source reads `http-429 (backing off, 12s left)` so a polling agent can see that it
-is the thing being throttled.
+**The endpoint is rate limited.** cc4a holds itself to at most one request per 60s
+per machine, which took two fixes beyond the obvious cache:
+
+- **Only one process fetches at a time.** A TTL cache does not serialise concurrent
+  misses, so every time it expired, every waiting caller went to the network
+  together: **twelve concurrent callers sent twelve requests**. Each one believed it
+  was respecting the 60s TTL. This is how ordinary, well-behaved polling reaches a
+  rate limit on a busy machine. Callers that lose the race now serve the slightly
+  stale cache — these percentages move slowly — so the same burst sends **one**
+  request.
+- **Failures are cached too.** Caching only successes makes a rate limit
+  self-sustaining: the 429 is not cached, the next poll re-fires immediately, and
+  earns another 429. Failures now back off (`Retry-After` when present, otherwise
+  10s doubling to 5m), shared across invocations via a file.
+
+While a backoff is in force the reported source reads
+`http-429 (backing off, 12s left)`, so a polling agent can tell it is the thing
+being throttled rather than seeing a generic outage.
 
 The two are deliberately separate because they have opposite cost and failure
 profiles. For both, run them together — one shell call, one round trip:

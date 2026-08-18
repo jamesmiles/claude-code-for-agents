@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -70,11 +70,17 @@ USAGE
   means the account uses an API key rather than a Pro/Max subscription, or the
   endpoint changed. Report that as unknown, not as healthy.
 
-  The endpoint is rate limited. Failures are cached as well as successes, so a
-  failing read backs off (Retry-After when the response carries it, otherwise
-  10s doubling to 5m) instead of re-firing on the next call. The backoff is a file
-  in the cache directory, so separate cc4a invocations share it. While it is in
-  force the source reads "http-429 (backing off, 12s left)" and no request is sent.
+  The endpoint is rate limited, and cc4a holds itself to at most one request per
+  60s per machine:
+
+    - successful reads are cached for 60s, shared across invocations;
+    - only one process fetches at a time. Without that, an expiring cache lets
+      every waiting caller through together — twelve concurrent callers sent
+      twelve requests. Losers serve the slightly stale cache instead, which is
+      why a source may read "cache (stale 74s, refresh in progress)";
+    - failures are cached too, with backoff: Retry-After when the response
+      carries it, otherwise 10s doubling to 5m. While backing off the source
+      reads "http-429 (backing off, 12s left)" and no request is sent.
 
 IF YOU ARE AN AGENT RUNNING THIS
   5-hour window above ~80%: say so before starting an expensive fan-out and let the
@@ -341,6 +347,54 @@ def is_permanent(src):
     return any((src or "").startswith(x) for x in PERMANENT_UNAVAILABLE)
 
 
+LOCK_FILE = os.path.join(CACHE, "cc4a-limits.lock")
+LOCK_STALE = 30         # longer than the request timeout; a lock older than this is dead
+
+
+def _read_cache(max_age=None):
+    """The cached limits, optionally only if younger than max_age."""
+    try:
+        age = time.time() - os.path.getmtime(LIMITS_CACHE)
+        if max_age is not None and age >= max_age:
+            return None, age
+        with open(LIMITS_CACHE) as f:
+            return json.load(f), age
+    except Exception:
+        return None, None
+
+
+def _acquire_lock():
+    """One fetch at a time per machine.
+
+    An expiring cache otherwise lets every waiting process through at once: twelve
+    concurrent callers produced eleven requests, which is how ordinary polling
+    reaches a rate limit even though each caller believes it is respecting the TTL.
+    """
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        try:
+            if time.time() - os.path.getmtime(LOCK_FILE) > LOCK_STALE:
+                os.remove(LOCK_FILE)     # holder died mid-fetch
+                return _acquire_lock()
+        except OSError:
+            pass
+        return False
+    except OSError:
+        return True                      # cannot lock here; do not block the fetch
+
+
+def _release_lock():
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
 def _read_fail():
     try:
         with open(FAIL_CACHE) as f:
@@ -415,18 +469,39 @@ def oauth_token():
 
 # ---------- usage ----------
 def fetch_limits():
-    try:
-        st = os.stat(LIMITS_CACHE)
-        if time.time() - st.st_mtime < LIMITS_TTL:
-            with open(LIMITS_CACHE) as f:
-                return json.load(f), "cache"
-    except Exception:
-        pass
+    data, _ = _read_cache(LIMITS_TTL)
+    if data is not None:
+        return data, "cache"
+
     # Still inside a backoff window from an earlier failure: do not send anything.
     fail = _read_fail()
     if fail and time.time() < fail.get("retry_at", 0):
         return None, "%s (backing off, %ds left)" % (
             fail.get("status", "?"), int(fail["retry_at"] - time.time()))
+
+    if not _acquire_lock():
+        # Another process is already refreshing. Slightly stale numbers beat a
+        # duplicate request; these percentages move slowly.
+        data, age = _read_cache()
+        if data is not None:
+            return data, "cache (stale %ds, refresh in progress)" % age
+        for _ in range(25):              # no data at all yet — wait for the winner
+            time.sleep(0.2)
+            data, age = _read_cache(LIMITS_TTL)
+            if data is not None:
+                return data, "cache (fetched by another process)"
+        return None, "busy (another process is fetching)"
+    try:
+        return _fetch_limits_locked(fail)
+    finally:
+        _release_lock()
+
+
+def _fetch_limits_locked(fail):
+    # The process we queued behind may have just refreshed it.
+    data, _ = _read_cache(LIMITS_TTL)
+    if data is not None:
+        return data, "cache"
 
     tok = oauth_token()
     if not tok:
