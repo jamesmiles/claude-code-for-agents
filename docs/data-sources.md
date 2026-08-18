@@ -211,7 +211,18 @@ runs:
 ```
 
 `busy` means a turn is in flight, `waiting` means it is waiting on the user, `idle`
-means neither. Combined with the section above this is enough to distinguish "the
+means neither.
+
+**`busy` is not self-clearing.** It is set when a turn starts, and a crashed or
+abandoned turn leaves it asserting work that stopped long ago. Observed here: a
+session reporting `busy` whose transcript had not been written in 59 minutes, while
+the terminal multiplexer holding its pane independently reported the same agent as
+idle. It was the only one of 41 sessions where the two sources disagreed.
+
+Cross-check it against the transcript's mtime before trusting it. A genuinely busy
+session writes every few seconds, so `busy` plus a transcript untouched for minutes
+means the flag is stale, not that work is happening. `waiting` carries no such
+problem — it may legitimately sit for hours. Combined with the section above this is enough to distinguish "the
 value I am watching has not moved yet" from "the value I am watching cannot move,
 because I am the one blocking it": unchanged own-context plus `status: busy` means
 the watcher is inside the very turn whose completion it is waiting for.

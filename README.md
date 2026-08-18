@@ -79,6 +79,12 @@ that `cc4a wait --context-above=80@<id>` and `cc4a context --session=<id>` take.
 `LAST` is the age of the session's **transcript** — the truest "last did something"
 signal, since a session record's own `updatedAt` only moves on state transitions.
 
+A status of `busy?` means the session claims to be busy but has not written its
+transcript in `--stale-after` (default 5m). Claude Code sets that flag when a turn
+starts and does not reliably clear it, so a crashed or abandoned turn keeps
+asserting work that stopped long ago. `--active` excludes them; `--json` carries
+`status_stale` beside the raw `status`.
+
 It stays fast on real machines by reading each transcript **backwards from EOF**
 rather than parsing it. The record it needs is in the last few KB, so a 143MB log
 resolves in ~1ms and all 41 sessions here list in 0.2s. `cc4a context` uses the same

@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -210,13 +210,21 @@ SESSIONS_HELP = """cc4a sessions — every Claude Code session on this host.
 USAGE
   cc4a sessions [--active] [--json] [--top=N]
 
-  --active  only sessions whose turn is in flight or awaiting input (busy/waiting)
+  --active  only sessions whose turn is in flight or awaiting input (busy/waiting),
+            excluding those whose busy flag has gone stale
   --top=    rows to show, newest activity first. Default 20; --json returns all.
+  --stale-after=  how long a "busy" session may go without writing its transcript
+            before its status is treated as stale. Default 5m.
 
 COLUMNS
   STATUS    busy    a turn is in flight
             waiting waiting on the user
             idle    neither
+            busy?   claims busy, but its transcript has not been written in
+                    --stale-after. Claude Code sets this flag when a turn starts
+                    and does not reliably clear it, so a crashed or abandoned turn
+                    keeps asserting work that stopped long ago. --active excludes
+                    these; --json carries status_stale alongside the raw status.
   LAST      how long since the session's transcript was last written — the truest
             "last did something" signal, since the record's own updatedAt only
             moves on state transitions.
@@ -983,7 +991,13 @@ def ago(seconds):
     return "%dd" % (seconds // 86400)
 
 
-def build_sessions(active_only=False):
+# Claude Code writes "busy" when a turn starts but does not reliably clear it, so a
+# crashed or abandoned turn leaves the field asserting work that stopped long ago.
+# A genuinely busy session writes to its transcript every few seconds.
+STALE_BUSY_SECONDS = 300
+
+
+def build_sessions(active_only=False, stale_after=STALE_BUSY_SECONDS):
     recs = []
     for f in glob.glob(os.path.join(HOME, ".claude", "sessions", "*.json")):
         try:
@@ -1024,8 +1038,13 @@ def build_sessions(active_only=False):
             "model": ctx.get("model"),
             "is_self": sid == os.environ.get("CLAUDE_CODE_SESSION_ID"),
         })
+        age = rows[-1]["last_active_seconds_ago"]
+        # "waiting" may legitimately sit untouched for hours; only "busy" goes stale.
+        rows[-1]["status_stale"] = bool(rows[-1]["status"] == "busy"
+                                        and age is not None and age > stale_after)
     if active_only:
-        rows = [r for r in rows if r["status"] in ("busy", "waiting")]
+        rows = [r for r in rows
+                if r["status"] in ("busy", "waiting") and not r["status_stale"]]
     rows.sort(key=lambda r: r["last_active_seconds_ago"] if r["last_active_seconds_ago"]
               is not None else 1 << 40)
     return rows
@@ -1045,9 +1064,14 @@ def human_sessions(rows, top):
                if r["context_used_percentage"] is not None else "-")
         last = ago(r["last_active_seconds_ago"]) if r["last_active_seconds_ago"] is not None else "-"
         cwd = (r["cwd"] or "").replace(HOME, "~")
+        status = (r["status"] or "?") + ("?" if r.get("status_stale") else "")
         out.append("%-8s %-8s %7s %6s  %-*s  %s%s" % (
-            r["status"] or "?", r["session_id"][:8], pct, last, namew, r["name"] or "", cwd,
+            status, r["session_id"][:8], pct, last, namew, r["name"] or "", cwd,
             "   <- this session" if r["is_self"] else ""))
+    if any(r.get("status_stale") for r in show):
+        out.append("")
+        out.append("busy? = claimed busy but its transcript has not been written in "
+                   "%s; the flag is not self-clearing." % fmt_dur(STALE_BUSY_SECONDS))
     if len(live) > top:
         out.append("... %d more (--top=%d, or --json for all)" % (len(live) - top, len(live)))
     return "\n".join(out)
@@ -1059,14 +1083,18 @@ def cmd_sessions(argv):
         return 0
     top = 20
     try:
-        check_args(argv, ("--json", "--active"), ("--top=",))
+        check_args(argv, ("--json", "--active"), ("--top=", "--stale-after="))
         for a in argv:
             if a.startswith("--top="):
                 top = int(a.split("=", 1)[1])
     except ValueError as e:
         print(str(e), file=sys.stderr)
         return 2
-    rows = build_sessions(active_only="--active" in argv)
+    stale_after = STALE_BUSY_SECONDS
+    for a in argv:
+        if a.startswith("--stale-after="):
+            stale_after = parse_duration(a.split("=", 1)[1], 0)
+    rows = build_sessions(active_only="--active" in argv, stale_after=stale_after)
     if "--json" in argv:
         print(json.dumps({"sessions": rows}, indent=2))
     else:
