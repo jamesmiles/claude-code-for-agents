@@ -3,7 +3,7 @@
 import json, os, subprocess, sys, time, glob, datetime, shutil, stat, tempfile
 import urllib.request, urllib.error
 
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 REPO = "jamesmiles/claude-code-for-agents"
 
 ROOT_HELP = """cc4a — claude-code-for-agents.
@@ -248,6 +248,12 @@ COLUMNS
             days ahead of anything anyone actually said.
   CONTEXT   that session's context window usage, read from the tail of its
             transcript. Cheap even for a 100MB+ log.
+            The reading only refreshes when a turn completes, so on an idle session
+            it is as old as that session's last turn; --json carries
+            context_as_of_seconds_ago so a caller can see how stale it is. A
+            compaction with no turn after it is picked up from its own record, so
+            a compacted-then-idle session reports its real post-compaction size
+            rather than the pre-compaction one.
             A leading ~ means the window size is assumed, not known: a session's
             own window is recorded nowhere readable, so above 200k tokens it must
             be the 1M window, but below that all cc4a has is this machine's
@@ -640,7 +646,14 @@ def window_size_guess():
 
 
 def tail_scan(path, chunk=262144, max_bytes=8 * 1024 * 1024):
-    """(last non-sidechain assistant record, newest user/assistant timestamp).
+    """(last assistant record, newest user/assistant timestamp, newer compaction).
+
+    The third value is a compact_boundary record *newer* than that assistant record,
+    or None. Compaction rewrites the context without producing a turn, so the last
+    usage block can describe a context that no longer exists — and since nothing
+    further is written until the next turn, the stale figure can stand for hours.
+    Observed here: sessions reporting 289,517 and 895,813 tokens whose real
+    post-compaction size was 3,819 and 14,590.
 
     Transcripts reach hundreds of megabytes; both answers live in the final few KB,
     so scanning forward to find them is pure waste. One backwards pass gets both.
@@ -654,7 +667,7 @@ def tail_scan(path, chunk=262144, max_bytes=8 * 1024 * 1024):
         size = os.path.getsize(path)
     except OSError:
         return None, None
-    record, newest_ts = None, None
+    record, newest_ts, compaction = None, None, None
     with open(path, "rb") as fh:
         tail, pos = b"", size
         while pos > 0 and size - pos < max_bytes:
@@ -666,11 +679,18 @@ def tail_scan(path, chunk=262144, max_bytes=8 * 1024 * 1024):
             # the first element may be a partial line unless we reached the start
             start = 0 if pos == 0 else 1
             for raw in reversed(lines[start:]):
-                if b'"assistant"' not in raw and b'"user"' not in raw:
+                if (b'"assistant"' not in raw and b'"user"' not in raw
+                        and b'"compact_boundary"' not in raw):
                     continue                       # cheap reject; parse decides
                 try:
                     d = json.loads(raw.decode("utf-8", "replace"))
                 except Exception:
+                    continue
+                if d.get("subtype") == "compact_boundary":
+                    # Only interesting if nothing has happened since; we are scanning
+                    # backwards, so an unset `record` means this boundary is newer.
+                    if record is None and compaction is None:
+                        compaction = d
                     continue
                 if d.get("type") not in ("user", "assistant") or d.get("isSidechain"):
                     continue
@@ -679,12 +699,19 @@ def tail_scan(path, chunk=262144, max_bytes=8 * 1024 * 1024):
                 if record is None and d.get("type") == "assistant":
                     record = d
                 if record is not None and newest_ts is not None:
-                    return record, newest_ts
-    return record, newest_ts
+                    return record, newest_ts, compaction
+    return record, newest_ts, compaction
 
 
 def last_assistant_record(path, **kw):
     return tail_scan(path, **kw)[0]
+
+
+def _ts_epoch(text):
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
 
 
 def build_context(sid):
@@ -703,7 +730,24 @@ def build_context(sid):
     path = find_transcript(sid)
     if not path:
         return {"source": "unavailable", "error": "no transcript for session %s" % sid}
-    last = last_assistant_record(path)
+    last, _, compaction = tail_scan(path)
+    if compaction is not None:
+        meta = compaction.get("compactMetadata") or {}
+        post = meta.get("postTokens")
+        if post is not None:
+            return finish_context({
+                "source": "transcript (post-compaction)",
+                "used_tokens": post,
+                "window_size": window_size_guess(),
+                "window_source": "assumed",
+                "model": (last or {}).get("message", {}).get("model"),
+                "transcript": path,
+                "as_of": compaction.get("timestamp"),
+                "as_of_seconds_ago": (int(time.time() - _ts_epoch(compaction["timestamp"]))
+                                      if compaction.get("timestamp") else None),
+                "note": "context was compacted (%s) after the last completed turn; "
+                        "this is the post-compaction size" % meta.get("trigger", "?"),
+            })
     if not last:
         return {"source": "unavailable", "error": "no completed assistant turn yet"}
     u = last["message"].get("usage", {})
@@ -723,6 +767,9 @@ def build_context(sid):
         "window_source": wsrc,
         "model": last["message"].get("model"),
         "transcript": path,
+        "as_of": last.get("timestamp"),
+        "as_of_seconds_ago": (int(time.time() - _ts_epoch(last["timestamp"]))
+                              if last.get("timestamp") else None),
         "note": "reflects the last completed turn; current turn is not yet written",
     })
 
@@ -1243,7 +1290,7 @@ def build_sessions(active_only=False, stale_after=STALE_BUSY_SECONDS):
         # Last *conversation* activity, not last file write: see tail_scan.
         last = None
         if path and os.path.exists(path):
-            _, ts = tail_scan(path)
+            _, ts, _cb = tail_scan(path)
             try:
                 last = (datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
                         .timestamp()) if ts else os.path.getmtime(path)
@@ -1268,6 +1315,11 @@ def build_sessions(active_only=False, stale_after=STALE_BUSY_SECONDS):
             "transcript_bytes": os.path.getsize(path) if path and os.path.exists(path) else None,
             "context_used_percentage": ctx.get("used_percentage"),
             "context_window_source": ctx.get("window_source"),
+            # How old the context reading itself is. It only refreshes when a turn
+            # completes or a compaction lands, so on an idle session it can be hours
+            # behind — and idle sessions are exactly what a compaction sweep selects.
+            "context_as_of": ctx.get("as_of"),
+            "context_as_of_seconds_ago": ctx.get("as_of_seconds_ago"),
             "context_used_tokens": ctx.get("used_tokens"),
             "context_window_size": ctx.get("window_size"),
             "model": ctx.get("model"),

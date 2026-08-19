@@ -150,6 +150,22 @@ CONTEXT  [##..................]  10.7%  106,679 / 1,000,000 tokens  (claude-opus
          note: reflects the last completed turn; current turn is not yet written
 ```
 
+**The reading is only as fresh as the session's last turn.** The usage block that
+carries it is written when a turn completes, so an idle session reports whatever was
+true when it last did something — hours ago, if it has been quiet that long. `--json`
+carries `as_of` and `as_of_seconds_ago` so a caller can see that rather than assume
+it is current, and `cc4a sessions --json` carries `context_as_of_seconds_ago` per
+session. This matters most for anything that selects idle sessions, such as a
+compaction sweep: the field is least current on exactly the population being read.
+
+**A compaction with no turn after it is picked up from its own record.** Compaction
+rewrites the context without producing a turn, so the last usage block describes a
+context that no longer exists, and nothing corrects it until the session is used
+again. Two sessions here reported 289,517 and 895,813 tokens whose real
+post-compaction size was 3,819 and 14,590 — overstated 76x and 61x. cc4a now reads
+`compactMetadata.postTokens` when a `compact_boundary` is newer than the last turn,
+and labels the source `transcript (post-compaction)`.
+
 Read from the session transcript, located via `$CLAUDE_CODE_SESSION_ID` — which
 Claude Code exports into every Bash call, so an agent runs this with no arguments
 and no knowledge of where it lives. Local file read: no network, no credentials,

@@ -416,6 +416,29 @@ def t_last_active_ignores_file_writes(e):
     assert 5.5 < days < 6.5, "reported %.2f days idle; mtime would have said ~0" % days
 
 
+@test("a compaction after the last turn is reflected, not the pre-compaction size")
+def t_compaction_boundary(e):
+    path = e.transcript(tokens=332_781, age_seconds=16 * 3600)
+    with open(path, "a") as f:                  # compacted, then silence
+        f.write(compact({
+            "type": "system", "subtype": "compact_boundary",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                       time.gmtime(time.time() - 15 * 3600)),
+            "compactMetadata": {"trigger": "manual", "preTokens": 332781,
+                                "postTokens": 10643}}) + "\n")
+    ctx = json.loads(e.run("context", "--json")[1])["context"]
+    assert ctx["used_tokens"] == 10643, "reported %s, the pre-compaction figure" % ctx["used_tokens"]
+    assert "post-compaction" in ctx["source"], ctx["source"]
+
+
+@test("context reports how old its reading is")
+def t_as_of(e):
+    e.transcript(age_seconds=4 * 3600)
+    ctx = json.loads(e.run("context", "--json")[1])["context"]
+    assert ctx.get("as_of"), ctx
+    assert 3.5 * 3600 < ctx["as_of_seconds_ago"] < 4.5 * 3600, ctx["as_of_seconds_ago"]
+
+
 @test("stats counts a repeated message.id once")
 def t_stats_dedupe(e):
     ns = e.module()

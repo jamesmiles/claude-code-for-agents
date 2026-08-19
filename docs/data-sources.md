@@ -216,6 +216,28 @@ Two details matter. Discard the first line of each chunk unless you have reached
 start of the file, since it is usually a partial line. And skip records with
 `isSidechain: true`, which belong to subagents rather than the session itself.
 
+## Compaction changes the context without writing a turn
+
+`usage` blocks are attached to assistant messages, so context occupancy only
+refreshes when a turn completes. Compaction is the exception that breaks naive
+readers: it replaces the context and records the fact separately, as
+
+```json
+{"type":"system","subtype":"compact_boundary",
+ "compactMetadata":{"trigger":"manual","preTokens":250636,"postTokens":6448,
+                    "cumulativeDroppedTokens":244188}}
+```
+
+If nothing further happens in that session, the newest usage block still describes
+the pre-compaction context and stays wrong indefinitely. Two transcripts here were
+overstated 76x and 61x this way. When scanning backwards, treat a `compact_boundary`
+found *before* any assistant record as authoritative and take `postTokens`.
+
+The general point is that this reading has an age. Report it — an `as_of` timestamp
+costs nothing and lets a caller distinguish "this session holds 300k tokens" from
+"this session held 300k tokens when it last ran, sixteen hours ago". Anything that
+selects for idle sessions is reading the field at its least current.
+
 ## A session's context window size is not recorded
 
 The transcript gives exact token counts but never the window they are measured
